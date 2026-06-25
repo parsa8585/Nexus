@@ -269,60 +269,47 @@ ssh_monitor() {
     trap 'tput rmcup 2>/dev/null; tput cnorm 2>/dev/null; return' INT
 
     while true; do
-        # Use who for active sessions (reliable TTY + login time)
-        # Format: USER TTY (IP) DATE TIME
-        mapfile -t WHO_LINES < <(who 2>/dev/null | grep pts || true)
-        COUNT=${#WHO_LINES[@]}
+        # ── Collect active sessions from who (all pts lines) ──────
+        declare -A TTY_IP TTY_LOGIN TTY_IDLE
 
-        # Build maps from who output
-        declare -A TTY_USER TTY_IP TTY_LOGIN
-        for _wl in "${WHO_LINES[@]}"; do
-            _wu=$(echo "$_wl"  | awk '{print $1}')
-            _wt=$(echo "$_wl"  | awk '{print $2}')
+        # who: USER  TTY  DATE  TIME  (IP)
+        while IFS= read -r _wl; do
+            _wt=$(echo "$_wl" | awk '{print $2}')
+            [ -z "$_wt" ] && continue
             _wip=$(echo "$_wl" | grep -oE '\([^)]+\)' | tr -d '()')
             _wdt=$(echo "$_wl" | awk '{print $3, $4}')
-            [ -n "$_wt" ] && TTY_USER["$_wt"]="$_wu"
-            [ -n "$_wt" ] && TTY_LOGIN["$_wt"]="$_wdt"
-            [ -n "$_wt" ] && [ -n "$_wip" ] && TTY_IP["$_wt"]="$_wip"
-        done
+            TTY_LOGIN["$_wt"]="$_wdt"
+            [ -n "$_wip" ] && TTY_IP["$_wt"]="$_wip"
+        done < <(who 2>/dev/null | grep 'pts/' || true)
 
-        # Build SSH_CLIENT map from /proc: username→realIP (most reliable)
-        declare -A USER_IP_MAP
-        for _pid_env in /proc/[0-9]*/environ; do
-            _p=$(echo "$_pid_env" | grep -oE '/proc/([0-9]+)/' | grep -oE '[0-9]+')
-            [ -z "$_p" ] && continue
-            _cmd=$(cat "/proc/${_p}/comm" 2>/dev/null || true)
-            [ "$_cmd" != "sshd" ] && continue
-            _env=$(strings "/proc/${_p}/environ" 2>/dev/null || cat "/proc/${_p}/environ" 2>/dev/null | tr '\0' '\n')
-            _sc=$(echo "$_env" | grep '^SSH_CLIENT=' | cut -d= -f2 | awk '{print $1}')
-            [ -z "$_sc" ] && continue
-            _un=$(echo "$_env" | grep '^USER=' | cut -d= -f2)
-            [ -z "$_un" ] && continue
-            # Only store if it looks like a real IP (not loopback 127.x)
-            echo "$_sc" | grep -qE '^127\.' && continue
-            USER_IP_MAP["$_un"]="$_sc"
-        done
-
-        # Also try ss to get PTY→IP for direct (non-proxied) connections
-        declare -A PTY_IP_MAP
-        while IFS= read -r _ssl; do
-            _foreign=$(echo "$_ssl" | awk '{print $5}')
-            _proc=$(echo "$_ssl"    | awk '{print $NF}')
-            _pts=$(echo "$_proc"    | grep -oE 'pts/[0-9]+' | head -1)
-            [ -z "$_pts" ] && continue
-            _rip=$(echo "$_foreign" | sed 's/\[//g;s/\]//g' | rev | cut -d':' -f2- | rev)
-            echo "$_rip" | grep -qE '^127\.' && continue
-            PTY_IP_MAP["$_pts"]="$_rip"
-        done < <(ss -tnp 2>/dev/null | grep -i sshd || true)
-
-        # IDLE from w (keyed by user+tty)
-        declare -A TTY_IDLE
+        # w -h: USER  TTY  FROM  LOGIN  IDLE  JCPU  PCPU  WHAT
         while IFS= read -r _wl; do
-            _wu=$(echo "$_wl" | awk '{print $1}')
             _wt=$(echo "$_wl" | awk '{print $2}')
             _wi=$(echo "$_wl" | awk '{print $5}')
             [ -n "$_wt" ] && TTY_IDLE["$_wt"]="$_wi"
-        done < <(w -h 2>/dev/null || true)
+        done < <(w -h 2>/dev/null | grep 'pts/' || true)
+
+        # ── Best source of IP: SSH_TTY env var in sshd child procs ──
+        # Each sshd child has SSH_CLIENT=<remoteIP port serverport>
+        # and SSH_TTY=/dev/pts/N  → lets us key by PTY exactly
+        declare -A PTY_IP_MAP
+        for _pid_env in /proc/[0-9]*/environ; do
+            _p="${_pid_env%/environ}"; _p="${_p##*/proc/}"
+            [ -z "$_p" ] && continue
+            _cmd=$(cat "/proc/${_p}/comm" 2>/dev/null) || continue
+            [ "$_cmd" != "sshd" ] && continue
+            # Read environ safely
+            _env=$(tr '\0' '\n' < "/proc/${_p}/environ" 2>/dev/null) || continue
+            _sc=$(echo "$_env" | grep '^SSH_CLIENT=' | cut -d= -f2 | awk '{print $1}')
+            [ -z "$_sc" ] || echo "$_sc" | grep -qE '^127\.' && continue
+            _stty=$(echo "$_env" | grep '^SSH_TTY=' | cut -d= -f2 | sed 's|/dev/||')
+            # _stty is now e.g. "pts/1"
+            [ -n "$_stty" ] && PTY_IP_MAP["$_stty"]="$_sc"
+        done
+
+        # Build final session list from who
+        mapfile -t WHO_LINES < <(who 2>/dev/null | grep 'pts/' || true)
+        COUNT=${#WHO_LINES[@]}
 
         OUT=""
         OUT+="$(sep_top)"$'\n'
@@ -341,10 +328,8 @@ ssh_monitor() {
                 U=$(echo "$_wl"   | awk '{print $1}')
                 TTY=$(echo "$_wl" | awk '{print $2}')
 
-                # IP priority: SSH_CLIENT env > ss PTY map > who parentheses
-                if [ -n "${USER_IP_MAP[$U]}" ]; then
-                    IP="${USER_IP_MAP[$U]}"
-                elif [ -n "${PTY_IP_MAP[$TTY]}" ]; then
+                # IP: proc/SSH_TTY map (per-PTY, most accurate) → who parentheses
+                if [ -n "${PTY_IP_MAP[$TTY]}" ]; then
                     IP="${PTY_IP_MAP[$TTY]}"
                 elif [ -n "${TTY_IP[$TTY]}" ]; then
                     IP="${TTY_IP[$TTY]}"
@@ -352,8 +337,8 @@ ssh_monitor() {
                     IP="-"
                 fi
 
+                # Login time: HH:MM if today, else MM-DD HH:MM
                 LOGIN="${TTY_LOGIN[$TTY]:-}"
-                # Format: HH:MM if today, else MM-DD HH:MM
                 _ldate=$(echo "$LOGIN" | awk '{print $1}')
                 _ltime=$(echo "$LOGIN" | awk '{print $2}' | cut -c1-5)
                 if [ "$_ldate" = "$(date '+%Y-%m-%d')" ]; then
@@ -371,7 +356,7 @@ ssh_monitor() {
         fi
         OUT+="$(sep_bot)"$'\n'
 
-        unset TTY_USER TTY_IP TTY_LOGIN TTY_IDLE PTY_IP_MAP USER_IP_MAP WHO_LINES
+        unset TTY_IP TTY_LOGIN TTY_IDLE PTY_IP_MAP WHO_LINES
 
         tput cup 0 0 2>/dev/null
         printf '%s' "$OUT"
