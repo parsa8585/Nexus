@@ -48,7 +48,7 @@ bash <(curl -s https://raw.githubusercontent.com/parsa8585/nexus/main/install.sh
 
 ```bash
 # Clone the repo
-git clone https://github.com/YOUR_USERNAME/nexus.git
+git clone https://github.com/parsa8585/nexus.git
 cd nexus
 
 # Make executable
