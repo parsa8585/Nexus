@@ -273,42 +273,40 @@ ssh_monitor() {
         COUNT=0; [ -n "$SESSIONS" ] && COUNT=$(echo "$SESSIONS" | grep -c . 2>/dev/null || echo 0)
 
         declare -A IP_MAP
-        # Method 1: map PTY → real remote IP via sshd child PIDs
+        # Build map: username → real remote IP from SSH_CLIENT in sshd process env
+        # sshd forks a child per session; that child has SSH_CLIENT set
+        declare -A USER_IP_MAP
+        for _pid in /proc/[0-9]*/environ; do
+            _p=$(echo "$_pid" | grep -oE '[0-9]+')
+            [ -z "$_p" ] && continue
+            # Only look at sshd processes
+            _cmd=$(cat "/proc/${_p}/comm" 2>/dev/null)
+            [ "$_cmd" != "sshd" ] && continue
+            _env=$(cat "/proc/${_p}/environ" 2>/dev/null | tr '\0' '\n')
+            _ssh_client=$(echo "$_env" | grep '^SSH_CLIENT=' | cut -d= -f2 | awk '{print $1}')
+            [ -z "$_ssh_client" ] && continue
+            # Skip private/loopback
+            echo "$_ssh_client" | grep -qE '^(127\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|::1)' && continue
+            _uname=$(echo "$_env" | grep '^USER=' | cut -d= -f2)
+            [ -z "$_uname" ] && _uname=$(cat "/proc/${_p}/loginuid" 2>/dev/null                 | xargs -I{} getent passwd {} 2>/dev/null | cut -d: -f1)
+            [ -n "$_uname" ] && USER_IP_MAP["$_uname"]="$_ssh_client"
+        done
+
+        # Map PTY → IP via ss (for non-tunnel direct connections)
         while IFS= read -r ssline; do
             FOREIGN=$(echo "$ssline" | awk '{print $5}')
             PROC=$(echo "$ssline"    | awk '{print $NF}')
             RAW_IP=$(echo "$FOREIGN" | sed 's/\[//g;s/\]//g' | rev | cut -d':' -f2- | rev)
-            # Skip loopback / private tunnel addresses
-            if echo "$RAW_IP" | grep -qE '^(127\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)'; then
-                continue
-            fi
+            echo "$RAW_IP" | grep -qE '^(127\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)' && continue
             PTS=$(echo "$PROC" | grep -oE 'pts/[0-9]+' | head -1)
             [ -n "$PTS" ] && [ -n "$RAW_IP" ] && IP_MAP["$PTS"]="$RAW_IP"
         done < <(ss -tnp 2>/dev/null | grep -i sshd || true)
 
-        # Method 2: for PTYs still missing, try sshd env SSH_CLIENT via /proc
-        while IFS= read -r sess; do
-            [ -z "$sess" ] && continue
-            TTY=$(echo "$sess" | awk '{print $2}')
-            [ -n "${IP_MAP[$TTY]}" ] && continue
-            # Find sshd PID that has this tty open
-            SSHD_PID=$(ls -la /proc/*/fd 2>/dev/null \
-                | grep -l "/dev/${TTY}" 2>/dev/null \
-                | grep -oE '/proc/[0-9]+/' | grep -oE '[0-9]+' | head -1 || true)
-            if [ -n "$SSHD_PID" ]; then
-                ENV_IP=$(cat "/proc/${SSHD_PID}/environ" 2>/dev/null \
-                    | tr '\0' '\n' | grep '^SSH_CLIENT=' \
-                    | cut -d= -f2 | awk '{print $1}')
-                [ -n "$ENV_IP" ] && IP_MAP["$TTY"]="$ENV_IP"
-            fi
-        done <<< "$SESSIONS"
-
-        # Method 3: fallback to who (may contain real IP in parentheses)
+        # Fallback: who output (contains real IP in parentheses for direct SSH)
         declare -A WHO_MAP
         while IFS= read -r wholine; do
             W_TTY=$(echo "$wholine" | awk '{print $2}')
             W_IP=$(echo "$wholine"  | grep -oE '\([0-9a-fA-F:.]+\)' | tr -d '()')
-            # Skip loopback
             echo "$W_IP" | grep -qE '^(127\.|::1)' && continue
             [ -n "$W_TTY" ] && [ -n "$W_IP" ] && WHO_MAP["$W_TTY"]="$W_IP"
         done < <(who 2>/dev/null || true)
@@ -334,12 +332,15 @@ ssh_monitor() {
                 IDLE=$( echo "$sess" | awk '{print $5}')
                 WHAT=$( echo "$sess" | awk '{print $8}' | cut -c1-8)
 
+                # Priority: PTY→IP (ss) > USER→IP (SSH_CLIENT env) > who > unknown
                 if [ -n "${IP_MAP[$TTY]}" ]; then
                     IP="${IP_MAP[$TTY]}"
+                elif [ -n "${USER_IP_MAP[$U]}" ]; then
+                    IP="${USER_IP_MAP[$U]}"
                 elif [ -n "${WHO_MAP[$TTY]}" ]; then
                     IP="${WHO_MAP[$TTY]}"
                 else
-                    IP="local"
+                    IP="unknown"
                 fi
 
                 LINE=$(printf "  %-10s%-16s%-9s%-6s%s" \
@@ -349,7 +350,7 @@ ssh_monitor() {
         fi
         OUT+="$(sep_bot)"$'\n'
 
-        unset IP_MAP WHO_MAP
+        unset IP_MAP WHO_MAP USER_IP_MAP
 
         tput cup 0 0 2>/dev/null
         printf '%s' "$OUT"
@@ -761,35 +762,34 @@ user_manager() {
   ${DIM}Press any key...${NC}"; read -n 1 ;;
             3)
                 clear
-                sep_top; row "                 SSH User List"; sep_mid
-                printf "${CYAN}|${NC}%-14s${CYAN}|${NC}%-10s${CYAN}|${NC}%-10s${CYAN}|${NC}%-16s${CYAN}|${NC}\n" \
-                    " USERNAME" " SESSION" " ACCOUNT" " GROUPS"
+                sep_top
+                row "$(printf '%*s%s' $(( (W - 13) / 2 )) '' 'SSH User List')"
+                sep_mid
+                # Header row — no color in cells so printf width is exact
+                printf "${CYAN}|${NC}%-13s${CYAN}|${NC}%-10s${CYAN}|${NC}%-9s${CYAN}|${NC}%-17s${CYAN}|${NC}\n" \
+                    "  USERNAME" "  ACCOUNT" " SESSION" "  GROUPS"
                 sep_mid
                 awk -F: '$3>=1000 && $7~/bash|sh/{print $1}' /etc/passwd 2>/dev/null | while read -r u; do
                     GRPS=$(id -Gn "$u" 2>/dev/null | tr ' ' ',' | cut -c1-15)
+                    # Account lock status — build padded plain label, print color separately
+                    _LS=$(passwd -S "$u" 2>/dev/null | awk '{print $2}')
+                    if [ "$_LS" = "L" ] || [ "$_LS" = "LK" ]; then
+                        ACC_C="${RED}"; ACC_L=" disabled "
+                    else
+                        ACC_C="${GREEN}"; ACC_L=" enabled  "
+                    fi
                     # Session status
                     if w -h 2>/dev/null | awk '{print $1}' | grep -qw "$u" 2>/dev/null || \
                        who 2>/dev/null | awk '{print $1}' | grep -qw "$u" 2>/dev/null; then
-                        SES_STR="\e[32m *online\e[0m"
-                        SES_VIS=8
+                        SES_C="${GREEN}"; SES_L=" *online "
                     else
-                        SES_STR="\e[2m offline\e[0m"
-                        SES_VIS=7
+                        SES_C="${DIM}";  SES_L=" offline "
                     fi
-                    # Account enabled/disabled (lock status)
-                    _LS=$(passwd -S "$u" 2>/dev/null | awk '{print $2}')
-                    if [ "$_LS" = "L" ] || [ "$_LS" = "LK" ]; then
-                        ACC_STR="\e[31m disabled\e[0m"
-                        ACC_VIS=8
-                    else
-                        ACC_STR="\e[32m enabled\e[0m"
-                        ACC_VIS=7
-                    fi
-                    # Print row manually to handle color widths
-                    printf "${CYAN}|${NC}%-14s${CYAN}|${NC}" " ${u:0:12}"
-                    printf "${ACC_STR}%$((10-ACC_VIS))s${CYAN}|${NC}" ""
-                    printf "${SES_STR}%$((10-SES_VIS))s${CYAN}|${NC}" ""
-                    printf "%-16s${CYAN}|${NC}\n" " ${GRPS:0:14}"
+                    # Fixed-width cells: color wraps only the label (no spaces inside escape)
+                    # Col widths: 13 | 10 | 9 | 17  → total inner = 13+10+9+17 + 4 borders = 53... adjust
+                    # W=52: |13|10|9|17| = 13+1+10+1+9+1+17+1 = 53 → use 13|10|9|16
+                    printf "${CYAN}|${NC}  %-11s${CYAN}|${NC}${ACC_C}%-10s${NC}${CYAN}|${NC}${SES_C}%-9s${NC}${CYAN}|${NC}  %-15s${CYAN}|${NC}\n" \
+                        "${u:0:11}" "$ACC_L" "$SES_L" "${GRPS:0:15}"
                 done
                 sep_bot; echo ""
                 echo -ne "  ${DIM}Press any key...${NC}"; read -n 1
@@ -1837,8 +1837,18 @@ ssl_checker() {
         local DOMAIN="$1"
         local CONNECT_HOST="${2:-$1}"
         local PORT="${3:-443}"
+        local RESOLVED_IP="${4:-}"
+        # If no resolved IP passed in, resolve now
+        if [ -z "$RESOLVED_IP" ]; then
+            if command -v dig &>/dev/null; then
+                RESOLVED_IP=$(dig +short "$CONNECT_HOST" 2>/dev/null | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1)
+            elif command -v getent &>/dev/null; then
+                RESOLVED_IP=$(getent hosts "$CONNECT_HOST" 2>/dev/null | awk '{print $1}' | head -1)
+            fi
+        fi
+        [ -z "$RESOLVED_IP" ] && RESOLVED_IP="N/A"
 
-        echo -e "\n  ${CYAN}[*] Checking: ${DOMAIN} via ${CONNECT_HOST}:${PORT}${NC}\n"
+        echo -e "\n  ${CYAN}[*] Checking: ${DOMAIN} → ${RESOLVED_IP}:${PORT}${NC}\n"
 
         local RAW
         # Use timeout command for compatibility with all OpenSSL versions
@@ -1903,7 +1913,7 @@ ssl_checker() {
 
         sep_mid
         printf "  %-14s: %s\n" "Domain"     "$DOMAIN"
-        printf "  %-14s: %s\n" "Connected"  "${CONNECT_HOST}:${PORT}"
+        printf "  %-14s: %s\n" "Server IP"  "${RESOLVED_IP}"
         printf "  %-14s: %s\n" "Subject"    "${SUBJECT:0:34}"
         printf "  %-14s: %s\n" "Issuer"     "${ISSUER:0:34}"
         printf "  %-14s: %s\n" "Valid From" "$NOT_BEFORE"
@@ -1935,7 +1945,14 @@ ssl_checker() {
                 [ -z "$CHKDOM" ] && continue
                 echo -ne "  ${YELLOW}Port [443]: ${NC}"; read -r CHKPORT
                 [ -z "$CHKPORT" ] && CHKPORT=443
-                _ssl_check_domain "$CHKDOM" "$CHKDOM" "$CHKPORT"
+                # Resolve domain IP to show alongside domain name
+                _SA_IP=""
+                if command -v dig &>/dev/null; then
+                    _SA_IP=$(dig +short "$CHKDOM" 2>/dev/null | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1)
+                elif command -v getent &>/dev/null; then
+                    _SA_IP=$(getent hosts "$CHKDOM" 2>/dev/null | awk '{print $1}' | head -1)
+                fi
+                _ssl_check_domain "$CHKDOM" "$CHKDOM" "$CHKPORT" "$_SA_IP"
                 echo -ne "\n  ${DIM}Press any key...${NC}"; read -n 1
                 ;;
             2)
@@ -2895,46 +2912,77 @@ check_web_ports() {
     _check_port() {
         local PORT="$1"
         local LABEL="$2"
-        # Check if listening locally
+
+        # 1) Listening on server?
         local LISTENING="No"
-        if ss -tlnp 2>/dev/null | grep -q ":${PORT} " || \
-           ss -tlnp 2>/dev/null | grep -q ":${PORT}$"; then
+        if ss -tlnp 2>/dev/null | grep -qE ":${PORT}[[:space:]]|:${PORT}$"; then
             LISTENING="Yes"
         fi
-        # Check firewall
-        local FW_STATUS="Unknown"
+
+        # 2) Firewall status
+        local FW_OK="Unknown"
         if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
             if ufw status 2>/dev/null | grep -qw "$PORT"; then
-                FW_STATUS="Allowed (UFW)"
+                FW_OK="Allowed"
             else
-                FW_STATUS="No UFW rule"
+                FW_OK="Blocked"
             fi
         elif command -v iptables &>/dev/null; then
             if iptables -L INPUT -n 2>/dev/null | grep -q "dpt:${PORT}"; then
-                FW_STATUS="Allowed (iptables)"
+                FW_OK="Allowed"
             else
-                FW_STATUS="No iptables rule"
+                FW_OK="Blocked"
             fi
         else
-            FW_STATUS="No firewall detected"
+            FW_OK="No firewall"
         fi
-        # Try connect externally via /dev/tcp
-        local REACHABLE="Testing..."
+
+        # 3) Actually connectable on this server?
+        local USABLE="Closed"
         if timeout 3 bash -c ">/dev/tcp/127.0.0.1/${PORT}" 2>/dev/null; then
-            REACHABLE="Open (local)"
+            USABLE="Open"
+        fi
+
+        # 4) Summary verdict
+        local VERDICT VCOLOR
+        if [ "$LISTENING" = "Yes" ] && [ "$USABLE" = "Open" ] && [ "$FW_OK" != "Blocked" ]; then
+            VERDICT="✔ Available"; VCOLOR="${GREEN}"
+        elif [ "$LISTENING" = "No" ] && [ "$USABLE" = "Closed" ]; then
+            VERDICT="✘ Not in use"; VCOLOR="${DIM}"
         else
-            REACHABLE="Closed / No service"
+            VERDICT="⚠ Partial"; VCOLOR="${YELLOW}"
         fi
 
         sep_mid
-        row "  Port $PORT — $LABEL"
+        row "  Port ${PORT} — ${LABEL}"
+        sep_mid
+
+        # Listening row
         if [ "$LISTENING" = "Yes" ]; then
-            rowc $(( 22 )) "  Listening : ${GREEN}Yes${NC}"
+            rowc 36 "  Listening  : ${GREEN}Yes — service active${NC}"
         else
-            rowc $(( 21 )) "  Listening : ${RED}No${NC}"
+            rowc 29 "  Listening  : ${RED}No${NC}"
         fi
-        row "  Firewall  : $FW_STATUS"
-        row "  Local     : $REACHABLE"
+
+        # Firewall row
+        if [ "$FW_OK" = "Allowed" ]; then
+            rowc 35 "  Firewall   : ${GREEN}Allowed${NC}"
+        elif [ "$FW_OK" = "Blocked" ]; then
+            rowc 34 "  Firewall   : ${RED}Blocked${NC}"
+        else
+            rowc 37 "  Firewall   : ${DIM}No firewall${NC}"
+        fi
+
+        # Connectable row
+        if [ "$USABLE" = "Open" ]; then
+            rowc 32 "  Connect    : ${GREEN}Open${NC}"
+        else
+            rowc 31 "  Connect    : ${RED}Closed${NC}"
+        fi
+
+        # Verdict row
+        local VVIS=$(( ${#VERDICT} + 15 ))
+        rowc $VVIS "  Status     : ${VCOLOR}${VERDICT}${NC}"
     }
 
     _check_port 80  "HTTP"
