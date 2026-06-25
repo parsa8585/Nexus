@@ -531,8 +531,8 @@ user_manager() {
         row "   1.  Create New User"
         row "   2.  Remove User"
         row "   3.  List All SSH Users"
-        row "   4.  Modify User (Group & Permission)"
-        row "   5.  Modify Group (Create/Delete & Permission)"
+        row "   4.  Modify User"
+        row "   5.  Modify Group"
         row "   0.  Back to Main Menu"
         row ""
         sep_bot
@@ -732,19 +732,20 @@ user_manager() {
     done
 }
 
-# ── 5b. Modify User — group membership & per-user sudo permission ──
+# ── 5b. Modify User ──────────────────────────────────────────────
 modify_user() {
     while true; do
         clear
         sep_top
         row "$(printf '%*s%s' $(( (W - 11) / 2 )) '' 'Modify User')"
         sep_mid
-        row "  Group membership & sudo permission"
-        sep_mid
         row ""
         row "   1.  Add User to Group"
         row "   2.  Remove User from Group"
         row "   3.  Set User Permission (sudo)"
+        row "   4.  Change Username"
+        row "   5.  Change Password"
+        row "   6.  Change Shell"
         row "   0.  Back"
         row ""
         sep_bot
@@ -853,6 +854,97 @@ modify_user() {
                 esac
                 echo -ne "\n  ${DIM}Press any key...${NC}"; read -n 1
                 ;;
+            4)
+                clear
+                sep_top; row "           Change Username"; sep_bot; echo ""
+                echo -ne "  ${YELLOW}Current username : ${NC}"; read -r OLD_UNAME
+                [ -z "$OLD_UNAME" ] && continue
+                if ! id "$OLD_UNAME" &>/dev/null; then
+                    echo -e "  ${RED}User '$OLD_UNAME' not found.${NC}"; sleep 2; continue
+                fi
+                if [ "$OLD_UNAME" = "root" ]; then
+                    echo -e "  ${RED}[ERR] Cannot rename root.${NC}"; sleep 2; continue
+                fi
+                echo -ne "  ${YELLOW}New username     : ${NC}"; read -r NEW_UNAME
+                [ -z "$NEW_UNAME" ] && echo -e "  ${RED}Cancelled.${NC}" && sleep 1 && continue
+                if ! echo "$NEW_UNAME" | grep -qE '^[a-z_][a-z0-9_-]{0,31}$'; then
+                    echo -e "  ${RED}Invalid username. Use lowercase letters, numbers, _ or -.${NC}"
+                    sleep 2; continue
+                fi
+                if id "$NEW_UNAME" &>/dev/null; then
+                    echo -e "  ${RED}Username '$NEW_UNAME' already taken.${NC}"; sleep 2; continue
+                fi
+                # Rename user and home directory
+                usermod -l "$NEW_UNAME" "$OLD_UNAME" 2>/dev/null && \
+                    usermod -d "/home/${NEW_UNAME}" -m "$NEW_UNAME" 2>/dev/null
+                if id "$NEW_UNAME" &>/dev/null; then
+                    # Also rename primary group if it matches old username
+                    if getent group "$OLD_UNAME" &>/dev/null; then
+                        groupmod -n "$NEW_UNAME" "$OLD_UNAME" 2>/dev/null && \
+                            echo -e "  ${DIM}[OK] Primary group renamed to '$NEW_UNAME'.${NC}" || true
+                    fi
+                    echo -e "  ${GREEN}[OK] Username changed: '$OLD_UNAME' → '$NEW_UNAME'.${NC}"
+                else
+                    echo -e "  ${RED}[ERR] Failed to rename user.${NC}"
+                fi
+                echo -ne "\n  ${DIM}Press any key...${NC}"; read -n 1
+                ;;
+            5)
+                clear
+                sep_top; row "           Change Password"; sep_bot; echo ""
+                echo -ne "  ${YELLOW}Username : ${NC}"; read -r CHPASS_USER
+                [ -z "$CHPASS_USER" ] && continue
+                if ! id "$CHPASS_USER" &>/dev/null; then
+                    echo -e "  ${RED}User '$CHPASS_USER' not found.${NC}"; sleep 2; continue
+                fi
+                echo -ne "  ${YELLOW}New password : ${NC}"; read -rs CHPASS_NEW; echo ""
+                [ -z "$CHPASS_NEW" ] && echo -e "  ${RED}Cancelled.${NC}" && sleep 1 && continue
+                echo -ne "  ${YELLOW}Confirm      : ${NC}"; read -rs CHPASS_CONF; echo ""
+                if [ "$CHPASS_NEW" != "$CHPASS_CONF" ]; then
+                    echo -e "  ${RED}[ERR] Passwords do not match.${NC}"; sleep 2; continue
+                fi
+                if echo "${CHPASS_USER}:${CHPASS_NEW}" | chpasswd 2>/dev/null; then
+                    echo -e "  ${GREEN}[OK] Password changed for '$CHPASS_USER'.${NC}"
+                else
+                    echo -e "  ${RED}[ERR] Failed to change password.${NC}"
+                fi
+                echo -ne "\n  ${DIM}Press any key...${NC}"; read -n 1
+                ;;
+            6)
+                clear
+                sep_top; row "            Change Shell"; sep_bot; echo ""
+                echo -ne "  ${YELLOW}Username : ${NC}"; read -r CHSH_USER
+                [ -z "$CHSH_USER" ] && continue
+                if ! id "$CHSH_USER" &>/dev/null; then
+                    echo -e "  ${RED}User '$CHSH_USER' not found.${NC}"; sleep 2; continue
+                fi
+                CUR_SHELL=$(getent passwd "$CHSH_USER" | cut -d: -f7)
+                echo -e "  ${DIM}Current shell: ${CUR_SHELL}${NC}"
+                echo ""
+                echo -e "   1. /bin/bash"
+                echo -e "   2. /bin/sh"
+                echo -e "   3. /usr/sbin/nologin  (disable login)"
+                echo -e "   4. /bin/false          (disable login)"
+                echo -e "   5. Custom path"
+                echo -ne "\n  ${YELLOW}> Select: ${NC}"
+                read -n 1 SHOPT; echo ""
+                case $SHOPT in
+                    1) NEW_SHELL="/bin/bash" ;;
+                    2) NEW_SHELL="/bin/sh" ;;
+                    3) NEW_SHELL="/usr/sbin/nologin" ;;
+                    4) NEW_SHELL="/bin/false" ;;
+                    5)
+                        echo -ne "  ${YELLOW}Shell path: ${NC}"; read -r NEW_SHELL
+                        [ -z "$NEW_SHELL" ] && echo -e "  ${DIM}Cancelled.${NC}" && sleep 1 && continue ;;
+                    *) echo -e "  ${DIM}Cancelled.${NC}"; sleep 1; continue ;;
+                esac
+                if usermod -s "$NEW_SHELL" "$CHSH_USER" 2>/dev/null; then
+                    echo -e "  ${GREEN}[OK] Shell set to '$NEW_SHELL' for '$CHSH_USER'.${NC}"
+                else
+                    echo -e "  ${RED}[ERR] Failed. Shell path may not exist.${NC}"
+                fi
+                echo -ne "\n  ${DIM}Press any key...${NC}"; read -n 1
+                ;;
             0) return ;;
             *) echo -e "  ${RED}Invalid option.${NC}"; sleep 1 ;;
         esac
@@ -865,8 +957,6 @@ modify_group() {
         clear
         sep_top
         row "$(printf '%*s%s' $(( (W - 12) / 2 )) '' 'Modify Group')"
-        sep_mid
-        row "  Create/Delete groups & set permissions"
         sep_mid
         row ""
         row "   1.  Create Group"
@@ -1016,18 +1106,21 @@ modify_group() {
                 clear
                 sep_top; row "       List Groups & Permissions"; sep_mid
                 echo ""
-                printf "  ${CYAN}%-20s %-10s %-s${NC}\n" "GROUP" "GID" "MEMBERS / SUDOERS"
+                printf "  ${CYAN}%-20s %-6s %-s${NC}\n" "GROUP" "GID" "MEMBERS"
                 printf "  %s\n" "$(printf '%.0s-' {1..50})"
                 while IFS=: read -r GNAME _ GGID GMEMBERS; do
                     if [ "${GGID:-0}" -ge 1000 ] 2>/dev/null || \
                        echo "sudo docker www-data wheel" | grep -qw "$GNAME"; then
-                        SUDOERS_RULE=""
-                        if [ -f "/etc/sudoers.d/${GNAME}" ]; then
-                            SUDOERS_RULE=" [sudoers rule]"
-                        fi
-                        MEMBERS_DISP="${GMEMBERS:-<none>}"
-                        printf "  %-20s %-10s %s%s\n" \
-                            "${GNAME:0:19}" "$GGID" "${MEMBERS_DISP:0:20}" "$SUDOERS_RULE"
+                        SUDOERS_TAG=""
+                        [ -f "/etc/sudoers.d/${GNAME}" ] && SUDOERS_TAG=" ${YELLOW}[sudo]${NC}"
+                        # Build full member list: combine /etc/group members + users whose primary group matches
+                        PRIMARY_MEMBERS=$(awk -F: -v gid="$GGID" '$4==gid{print $1}' /etc/passwd 2>/dev/null | tr '\n' ',' | sed 's/,$//')
+                        ALL_MEMBERS="${GMEMBERS}"
+                        [ -n "$PRIMARY_MEMBERS" ] && [ -n "$ALL_MEMBERS" ] && ALL_MEMBERS="${ALL_MEMBERS},${PRIMARY_MEMBERS}"
+                        [ -z "$ALL_MEMBERS" ] && ALL_MEMBERS="$PRIMARY_MEMBERS"
+                        [ -z "$ALL_MEMBERS" ] && ALL_MEMBERS="<none>"
+                        printf "  %-20s %-6s " "${GNAME:0:19}" "$GGID"
+                        echo -e "${ALL_MEMBERS}${SUDOERS_TAG}"
                     fi
                 done < /etc/group 2>/dev/null
                 echo ""
