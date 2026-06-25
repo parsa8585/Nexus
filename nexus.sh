@@ -268,106 +268,56 @@ ssh_monitor() {
     tput smcup 2>/dev/null; tput civis 2>/dev/null
     trap 'tput rmcup 2>/dev/null; tput cnorm 2>/dev/null; return' INT
 
-    # Helper: username از PID
-    _get_user_for_pid() {
-        local pid="$1"
-        local uid
-        uid=$(awk '/^Uid:/{print $2; exit}' "/proc/${pid}/status" 2>/dev/null)
-        [ -z "$uid" ] && return
-        getent passwd "$uid" 2>/dev/null | cut -d: -f1
-    }
-
-    # Helper: login time از PID
-    _get_login_str() {
-        local pid="$1"
-        local _start_j _hz _boot _login_ts _login_str _today
-        _start_j=$(awk '{print $22}' "/proc/${pid}/stat" 2>/dev/null)
-        _hz=$(getconf CLK_TCK 2>/dev/null || echo 100)
-        _boot=$(awk '/^btime/{print $2}' /proc/stat 2>/dev/null)
-        _login_ts=$(( _boot + _start_j / _hz ))
-        _login_str=$(date -d "@${_login_ts}" '+%m-%d %H:%M' 2>/dev/null || echo "-")
-        _today=$(date '+%m-%d')
-        echo "$_login_str" | grep -q "^${_today}" && _login_str=$(echo "$_login_str" | awk '{print $2}')
-        echo "$_login_str"
-    }
-
     while true; do
-        # ── Arrays را هر بار fresh بساز (unset قبل از استفاده)
-        unset SEEN_PID SESSION_LINES
-        declare -A SEEN_PID
+        unset SESSION_LINES
         declare -a SESSION_LINES=()
+        declare -A _SEEN_CONN  # جلوگیری از duplicate: key=user|ip
 
-        # ── روش ۱: ss با دسترسی کامل (root یا sudo)
-        # ss -tnp همه PIDها رو فقط برای root نشون میده
-        # برای دیدن PID همه userها باید از /proc مستقیم بخونیم
-
-        # تمام sshd child processها رو از /proc بخون (این کار نیاز به root نداره برای خوندن UID)
+        # ── منبع حقیقت: /proc/PID/environ با SSH_CONNECTION
+        # SSH_CONNECTION فقط بعد از احراز هویت موفق set میشه
+        # brute-forceها و pre-auth connectionها این متغیر رو ندارن
         while IFS= read -r _pid_dir; do
             _pid=$(basename "$_pid_dir")
             # فقط sshd processها
-            _comm=$(cat "/proc/${_pid}/comm" 2>/dev/null)
-            [[ "$_comm" != "sshd" ]] && continue
-            # parent sshd (که daemon اصلیه) رو skip کن — child PIDها user رو handle میکنن
-            # child sshd: ppid خودش هم یه sshd هست
-            _ppid=$(awk '/^PPid:/{print $2; exit}' "/proc/${_pid}/status" 2>/dev/null)
-            _pcomm=$(cat "/proc/${_ppid}/comm" 2>/dev/null)
-            [[ "$_pcomm" != "sshd" ]] && continue
-            # duplicate check
-            [ -n "${SEEN_PID[$_pid]}" ] && continue
-            SEEN_PID["$_pid"]=1
-            # username
-            _uname=$(_get_user_for_pid "$_pid")
+            [[ "$(cat /proc/${_pid}/comm 2>/dev/null)" != "sshd" ]] && continue
+
+            # SSH_CONNECTION رو از environ بخون (null-separated)
+            _env_file="/proc/${_pid}/environ"
+            [ ! -r "$_env_file" ] && continue
+            _ssh_conn=$(tr '\0' '\n' < "$_env_file" 2>/dev/null | grep '^SSH_CONNECTION=' | head -1)
+            [ -z "$_ssh_conn" ] && continue
+            # SSH_CONNECTION=<client_ip> <client_port> <server_ip> <server_port>
+            _rip=$(echo "$_ssh_conn" | cut -d= -f2 | awk '{print $1}')
+            [ -z "$_rip" ] && continue
+            [[ "$_rip" == "127."* ]] && continue
+            [[ "$_rip" == "::1" ]]   && continue
+
+            # username از UID
+            _uid=$(awk '/^Uid:/{print $2;exit}' "/proc/${_pid}/status" 2>/dev/null)
+            [ -z "$_uid" ] && continue
+            _uname=$(getent passwd "$_uid" 2>/dev/null | cut -d: -f1)
             [ -z "$_uname" ] && continue
-            # IP از /proc/net/tcp یا ss
-            # سریع‌ترین راه: cmdline یا environ نداره → از ss با PID filter
-            _rip=$(ss -tnp 2>/dev/null | awk -v p="pid=${_pid}," '$0~p{print $5}' | head -1 \
-                   | sed 's/\[//g;s/\]//g' | rev | cut -d: -f2- | rev)
-            # اگه ss جواب نداد از /proc/net/tcp6 و tcp بخون
-            if [ -z "$_rip" ] || [[ "$_rip" == *"127."* ]] || [[ "$_rip" == "::1" ]]; then
-                # /proc/net/tcp  → hex IP:PORT
-                _fd_sock=$(ls -la "/proc/${_pid}/fd" 2>/dev/null | grep socket | grep -oE 'socket:\[[0-9]+\]' | grep -oE '[0-9]+' | head -1)
-                if [ -n "$_fd_sock" ]; then
-                    # از /proc/net/tcp6 بخون
-                    _hex=$(awk -v inode="$_fd_sock" '$10==inode{print $3}' /proc/net/tcp6 2>/dev/null | head -1)
-                    if [ -n "$_hex" ]; then
-                        # IPv6-mapped IPv4: 0000000000000000FFFF0000_hex_ip
-                        _hexip=$(echo "$_hex" | cut -d: -f1)
-                        # اگه IPv4-mapped باشه (آخرین 8 کاراکتر IP واقعیه)
-                        if [[ "$_hexip" =~ ^0+FFFF(.{8})$ ]] || [[ "$_hexip" =~ ^00000000000000000000FFFF(.{8})$ ]]; then
-                            _h="${BASH_REMATCH[1]}"
-                            _rip=$(printf '%d.%d.%d.%d' \
-                                0x${_h:6:2} 0x${_h:4:2} 0x${_h:2:2} 0x${_h:0:2})
-                        fi
-                    fi
-                    # از /proc/net/tcp بخون
-                    if [ -z "$_rip" ] || [[ "$_rip" == "0.0.0.0" ]]; then
-                        _hex=$(awk -v inode="$_fd_sock" '$10==inode{print $3}' /proc/net/tcp 2>/dev/null | head -1)
-                        if [ -n "$_hex" ]; then
-                            _hexip=$(echo "$_hex" | cut -d: -f1)
-                            _rip=$(printf '%d.%d.%d.%d' \
-                                0x${_hexip:6:2} 0x${_hexip:4:2} 0x${_hexip:2:2} 0x${_hexip:0:2})
-                        fi
-                    fi
-                fi
-            fi
-            [ -z "$_rip" ] && _rip="unknown"
-            _login_str=$(_get_login_str "$_pid")
+            # root رو نشون نده
+            [[ "$_uname" == "root" ]] && continue
+
+            # duplicate: یه user از یه IP فقط یه بار
+            _conn_key="${_uname}|${_rip}"
+            [ -n "${_SEEN_CONN[$_conn_key]}" ] && continue
+            _SEEN_CONN["$_conn_key"]=1
+
+            # login time از /proc/PID/stat فیلد 22
+            _start_j=$(awk '{print $22}' "/proc/${_pid}/stat" 2>/dev/null)
+            _hz=$(getconf CLK_TCK 2>/dev/null || echo 100)
+            _boot=$(awk '/^btime/{print $2}' /proc/stat 2>/dev/null)
+            _login_ts=$(( _boot + _start_j / _hz ))
+            _login_str=$(date -d "@${_login_ts}" '+%m-%d %H:%M' 2>/dev/null || echo "-")
+            _today=$(date '+%m-%d')
+            [[ "$_login_str" == ${_today}* ]] && _login_str=$(echo "$_login_str" | awk '{print $2}')
+
             SESSION_LINES+=("${_uname}|${_rip}|${_login_str}")
         done < <(ls -d /proc/[0-9]* 2>/dev/null)
 
-        # ── روش fallback: اگه /proc روش بالا نتیجه نداد از who + last بخون
-        if [ ${#SESSION_LINES[@]} -eq 0 ]; then
-            # who: کاربرانی که PTY دارن
-            declare -A _WHO_IP
-            while IFS= read -r _wl; do
-                _wuser=$(echo "$_wl" | awk '{print $1}')
-                _wip=$(echo "$_wl" | grep -oE '\([0-9a-fA-F:.]+\)' | tr -d '()')
-                _wtime=$(echo "$_wl" | awk '{print $3,$4}' | sed 's/ /-/')
-                [ -n "$_wuser" ] && SESSION_LINES+=("${_wuser}|${_wip:-local}|${_wtime}")
-            done < <(who 2>/dev/null | grep -v "^$")
-            unset _WHO_IP
-        fi
-
+        unset _SEEN_CONN
         COUNT=${#SESSION_LINES[@]}
 
         OUT=""
@@ -394,7 +344,7 @@ ssh_monitor() {
         fi
         OUT+="$(sep_bot)"$'\n'
 
-        unset SEEN_PID SESSION_LINES
+        unset SESSION_LINES
 
         tput cup 0 0 2>/dev/null
         printf '%s' "$OUT"
@@ -403,7 +353,6 @@ ssh_monitor() {
         read -t 3 -n 1 key 2>/dev/null || true
         [[ "$key" = "q" || "$key" = "Q" ]] && break
     done
-    unset -f _get_user_for_pid _get_login_str 2>/dev/null || true
     trap - INT; tput rmcup 2>/dev/null; tput cnorm 2>/dev/null
 }
 
