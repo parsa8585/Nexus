@@ -281,12 +281,35 @@ ssh_monitor() {
             [ -n "$PTS" ] && [ -n "$RAW_IP" ] && IP_MAP["$PTS"]="$RAW_IP"
         done < <(ss -tnp 2>/dev/null | grep -i sshd || true)
 
+        # Also try netstat if ss gave no results
+        if [ ${#IP_MAP[@]} -eq 0 ]; then
+            while IFS= read -r nsline; do
+                FOREIGN=$(echo "$nsline" | awk '{print $5}')
+                PROC=$(echo "$nsline" | awk '{print $NF}')
+                PTS=$(echo "$PROC" | grep -oE 'pts/[0-9]+' | head -1)
+                RAW_IP=$(echo "$FOREIGN" | rev | cut -d':' -f2- | rev)
+                [ -n "$PTS" ] && [ -n "$RAW_IP" ] && IP_MAP["$PTS"]="$RAW_IP"
+            done < <(netstat -tnp 2>/dev/null | grep -i sshd || true)
+        fi
+
         declare -A WHO_MAP
         while IFS= read -r wholine; do
             W_TTY=$(echo "$wholine"  | awk '{print $2}')
             W_IP=$(echo "$wholine"   | grep -oE '\([0-9a-fA-F:.]+\)' | tr -d '()')
             [ -n "$W_TTY" ] && [ -n "$W_IP" ] && WHO_MAP["$W_TTY"]="$W_IP"
         done < <(who 2>/dev/null || true)
+
+        # Build last-login IP map from 'last' command
+        declare -A LAST_MAP
+        while IFS= read -r lastline; do
+            L_USER=$(echo "$lastline" | awk '{print $1}')
+            L_TTY=$(echo "$lastline"  | awk '{print $2}')
+            L_IP=$(echo "$lastline"   | awk '{print $3}')
+            # Only keep valid IPs (not hostnames treated as IPs here)
+            if echo "$L_IP" | grep -qE '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$|^[0-9a-fA-F:]+:[0-9a-fA-F:]+$'; then
+                [ -n "$L_TTY" ] && LAST_MAP["$L_TTY"]="$L_IP"
+            fi
+        done < <(last -w 2>/dev/null | grep -v "^reboot\|^wtmp\|^$" | head -50 || true)
 
         OUT=""
         OUT+="$(sep_top)"$'\n'
@@ -313,6 +336,8 @@ ssh_monitor() {
                     IP="${IP_MAP[$TTY]}"
                 elif [ -n "${WHO_MAP[$TTY]}" ]; then
                     IP="${WHO_MAP[$TTY]}"
+                elif [ -n "${LAST_MAP[$TTY]}" ]; then
+                    IP="${LAST_MAP[$TTY]}"
                 else
                     IP="local"
                 fi
@@ -324,7 +349,7 @@ ssh_monitor() {
         fi
         OUT+="$(sep_bot)"$'\n'
 
-        unset IP_MAP WHO_MAP
+        unset IP_MAP WHO_MAP LAST_MAP
 
         tput cup 0 0 2>/dev/null
         printf '%s' "$OUT"
@@ -703,6 +728,10 @@ user_manager() {
                 fi
                 echo -ne "  ${RED}Are you sure? (y/N): ${NC}"; read -n 1 CONFIRM; echo ""
                 if [[ "$CONFIRM" = "y" || "$CONFIRM" = "Y" ]]; then
+                    # Save primary group name before deletion
+                    local DEL_PGROUP
+                    DEL_PGROUP=$(id -gn "$DELUSER" 2>/dev/null || true)
+
                     echo -e "  ${CYAN}[*] Killing active sessions...${NC}"
                     pkill -9 -u "$DELUSER" 2>/dev/null; sleep 1
                     echo -e "  ${CYAN}[*] Removing user...${NC}"
@@ -727,6 +756,15 @@ user_manager() {
                             echo -e "  ${GREEN}[OK] User '$DELUSER' force-removed.${NC}"
                         else
                             echo -e "  ${RED}[ERR] Could not remove. Are you root?${NC}"
+                        fi
+                    fi
+                    # Remove primary group if it was auto-created with the user (same name)
+                    if [ -n "$DEL_PGROUP" ] && [ "$DEL_PGROUP" = "$DELUSER" ]; then
+                        if getent group "$DEL_PGROUP" &>/dev/null; then
+                            groupdel "$DEL_PGROUP" 2>/dev/null && \
+                                echo -e "  ${GREEN}[OK] Primary group '$DEL_PGROUP' removed.${NC}" || \
+                                echo -e "  ${DIM}[!] Could not remove group '$DEL_PGROUP' (may have members).${NC}"
+                            rm -f "/etc/sudoers.d/${DEL_PGROUP}" "/etc/sudoers.d/${DEL_PGROUP}_docker" 2>/dev/null
                         fi
                     fi
                 else
@@ -756,7 +794,7 @@ user_manager() {
                 ;;
             4) modify_user ;;
             5) modify_group ;;
-            0) return ;;
+            0|q|Q) return ;;
             *) echo -e "  ${RED}Invalid option.${NC}"; sleep 1 ;;
         esac
     done
@@ -1022,7 +1060,7 @@ modify_user() {
                 esac
                 echo -ne "\n  ${DIM}Press any key...${NC}"; read -n 1
                 ;;
-            0) return ;;
+            0|q|Q) return ;;
             *) echo -e "  ${RED}Invalid option.${NC}"; sleep 1 ;;
         esac
     done
@@ -1183,21 +1221,48 @@ modify_group() {
                 clear
                 sep_top; row "       List Groups & Permissions"; sep_mid
                 echo ""
-                printf "  ${CYAN}%-20s %-6s %-s${NC}\n" "GROUP" "GID" "MEMBERS"
-                printf "  %s\n" "$(printf '%.0s-' {1..50})"
+                printf "  ${CYAN}%-18s %-6s %-14s %-s${NC}\n" "GROUP" "GID" "PERMISSIONS" "MEMBERS"
+                printf "  %s\n" "$(printf '%.0s-' {1..60})"
                 while IFS=: read -r GNAME _ GGID GMEMBERS; do
                     if [ "${GGID:-0}" -ge 1000 ] 2>/dev/null || \
                        echo "sudo docker www-data wheel" | grep -qw "$GNAME"; then
-                        SUDOERS_TAG=""
-                        [ -f "/etc/sudoers.d/${GNAME}" ] && SUDOERS_TAG=" ${YELLOW}[sudo]${NC}"
-                        # Build full member list: combine /etc/group members + users whose primary group matches
+                        # Determine permissions tag
+                        PERM_TAG="none"
+                        if [ -f "/etc/sudoers.d/${GNAME}" ]; then
+                            _RULE=$(cat "/etc/sudoers.d/${GNAME}" 2>/dev/null | head -1)
+                            if echo "$_RULE" | grep -q "NOPASSWD"; then
+                                if echo "$_RULE" | grep -q "/usr/bin/docker"; then
+                                    PERM_TAG="docker-sudo"
+                                else
+                                    PERM_TAG="sudo(nopwd)"
+                                fi
+                            else
+                                PERM_TAG="sudo(full)"
+                            fi
+                        elif [ -f "/etc/sudoers.d/${GNAME}_docker" ]; then
+                            PERM_TAG="docker"
+                        elif echo "sudo wheel" | grep -qw "$GNAME"; then
+                            PERM_TAG="sudo(full)"
+                        elif [ "$GNAME" = "docker" ]; then
+                            PERM_TAG="docker"
+                        elif [ "$GNAME" = "www-data" ]; then
+                            PERM_TAG="webserver"
+                        fi
+                        # Color the perm tag
+                        case "$PERM_TAG" in
+                            sudo*|docker*) PERM_COLOR="${YELLOW}" ;;
+                            webserver)     PERM_COLOR="${CYAN}" ;;
+                            *)             PERM_COLOR="${DIM}" ;;
+                        esac
+                        # Build full member list
                         PRIMARY_MEMBERS=$(awk -F: -v gid="$GGID" '$4==gid{print $1}' /etc/passwd 2>/dev/null | tr '\n' ',' | sed 's/,$//')
                         ALL_MEMBERS="${GMEMBERS}"
                         [ -n "$PRIMARY_MEMBERS" ] && [ -n "$ALL_MEMBERS" ] && ALL_MEMBERS="${ALL_MEMBERS},${PRIMARY_MEMBERS}"
                         [ -z "$ALL_MEMBERS" ] && ALL_MEMBERS="$PRIMARY_MEMBERS"
                         [ -z "$ALL_MEMBERS" ] && ALL_MEMBERS="<none>"
-                        printf "  %-20s %-6s " "${GNAME:0:19}" "$GGID"
-                        echo -e "${ALL_MEMBERS}${SUDOERS_TAG}"
+                        printf "  %-18s %-6s " "${GNAME:0:17}" "$GGID"
+                        printf "${PERM_COLOR}%-14s${NC}" "${PERM_TAG:0:13}"
+                        echo -e " ${ALL_MEMBERS:0:20}"
                     fi
                 done < /etc/group 2>/dev/null
                 echo ""
@@ -1208,7 +1273,7 @@ modify_group() {
                 done
                 echo ""; echo -ne "  ${DIM}Press any key...${NC}"; read -n 1
                 ;;
-            0) return ;;
+            0|q|Q) return ;;
             *) echo -e "  ${RED}Invalid option.${NC}"; sleep 1 ;;
         esac
     done
@@ -1255,7 +1320,7 @@ fail2ban_manager() {
                     fi
                     echo -ne "\n  ${DIM}Press any key...${NC}"; read -n 1
                     ;;
-                0) return ;;
+                0|q|Q) return ;;
             esac
             continue
         fi
@@ -1391,7 +1456,7 @@ fail2ban_manager() {
                 else
                     echo -e "  ${DIM}Cancelled.${NC}"; sleep 1
                 fi ;;
-            0) return ;;
+            0|q|Q) return ;;
             *) echo -e "  ${RED}Invalid option.${NC}"; sleep 1 ;;
         esac
     done
@@ -1670,7 +1735,7 @@ port_manager() {
                 echo ""; sep_bot
                 echo -ne "\n  ${DIM}Press any key...${NC}"; read -n 1
                 ;;
-            0) return ;;
+            0|q|Q) return ;;
             *) echo -e "  ${RED}Invalid option.${NC}"; sleep 1 ;;
         esac
     done
@@ -1718,7 +1783,7 @@ speed_test() {
                     apt update 2>/dev/null && apt install -y speedtest-cli 2>/dev/null || \
                         echo -e "  ${YELLOW}[!] apt install failed. Try pip3 option.${NC}"
                     echo -ne "\n  ${DIM}Press any key...${NC}"; read -n 1 ;;
-                0) return ;;
+                0|q|Q) return ;;
             esac
             continue
         fi
@@ -1762,7 +1827,7 @@ speed_test() {
                     echo -e "  ${DIM}Cancelled.${NC}"
                 fi
                 echo -ne "\n  ${DIM}Press any key...${NC}"; read -n 1 ;;
-            0) return ;;
+            0|q|Q) return ;;
             *) echo -e "  ${RED}Invalid option.${NC}"; sleep 1 ;;
         esac
     done
@@ -1788,7 +1853,7 @@ ssl_checker() {
                 yum install -y openssl 2>/dev/null || \
                 dnf install -y openssl 2>/dev/null
                 echo -ne "\n  ${DIM}Press any key...${NC}"; read -n 1 ;;
-            0) return ;;
+            0|q|Q) return ;;
         esac
         return
     fi
@@ -1921,7 +1986,7 @@ ssl_checker() {
                 _ssl_check_domain "$CF_DOMAIN" "$CF_IP" "$CF_PORT"
                 echo -ne "\n  ${DIM}Press any key...${NC}"; read -n 1
                 ;;
-            0) return ;;
+            0|q|Q) return ;;
             *) echo -e "  ${RED}Invalid option.${NC}"; sleep 1 ;;
         esac
     done
@@ -2025,7 +2090,7 @@ install_xui() {
                                 echo -e "  ${GREEN}[OK] Removed.${NC}"
                             else echo -e "  ${DIM}Cancelled.${NC}"; fi
                             echo -ne "\n  ${DIM}Press any key...${NC}"; read -n 1 ;;
-                        0) break ;;
+                        0|q|Q) break ;;
                         *) echo -e "  ${RED}Invalid.${NC}"; sleep 1 ;;
                     esac
                 done ;;
@@ -2069,7 +2134,7 @@ install_xui() {
                                 echo -e "  ${GREEN}[OK] Removed.${NC}"
                             else echo -e "  ${DIM}Cancelled.${NC}"; fi
                             echo -ne "\n  ${DIM}Press any key...${NC}"; read -n 1 ;;
-                        0) break ;;
+                        0|q|Q) break ;;
                         *) echo -e "  ${RED}Invalid.${NC}"; sleep 1 ;;
                     esac
                 done ;;
@@ -2127,7 +2192,7 @@ install_xui() {
                                 echo -e "  ${GREEN}[OK] Removed.${NC}"
                             else echo -e "  ${DIM}Cancelled.${NC}"; fi
                             echo -ne "\n  ${DIM}Press any key...${NC}"; read -n 1 ;;
-                        0) break ;;
+                        0|q|Q) break ;;
                         *) echo -e "  ${RED}Invalid.${NC}"; sleep 1 ;;
                     esac
                 done ;;
@@ -2171,7 +2236,7 @@ install_xui() {
                                 echo -e "  ${GREEN}[OK] Removed.${NC}"
                             else echo -e "  ${DIM}Cancelled.${NC}"; fi
                             echo -ne "\n  ${DIM}Press any key...${NC}"; read -n 1 ;;
-                        0) break ;;
+                        0|q|Q) break ;;
                         *) echo -e "  ${RED}Invalid.${NC}"; sleep 1 ;;
                     esac
                 done ;;
@@ -2229,12 +2294,12 @@ install_xui() {
                                 echo -e "  ${GREEN}[OK] Removed.${NC}"
                             else echo -e "  ${DIM}Cancelled.${NC}"; fi
                             echo -ne "\n  ${DIM}Press any key...${NC}"; read -n 1 ;;
-                        0) break ;;
+                        0|q|Q) break ;;
                         *) echo -e "  ${RED}Invalid.${NC}"; sleep 1 ;;
                     esac
                 done ;;
 
-            0) return ;;
+            0|q|Q) return ;;
             *) echo -e "  ${RED}Invalid option.${NC}"; sleep 1 ;;
         esac
     done
@@ -2387,7 +2452,7 @@ dns_manager() {
                     echo -e "  ${RED}[ERR] dig and nslookup not found.${NC}"
                 fi
                 echo -ne "\n  ${DIM}Press any key...${NC}"; read -n 1 ;;
-            0) return ;;
+            0|q|Q) return ;;
             *) echo -e "  ${RED}Invalid option.${NC}"; sleep 1 ;;
         esac
     done
@@ -2413,7 +2478,7 @@ iptables_manager() {
                    yum install -y iptables 2>/dev/null || \
                    dnf install -y iptables 2>/dev/null
                    echo -ne "\n  ${DIM}Press any key...${NC}"; read -n 1 ;;
-                0) return ;;
+                0|q|Q) return ;;
             esac; continue
         fi
 
@@ -2512,7 +2577,7 @@ iptables_manager() {
                     echo -e "  ${RED}[ERR] $SAVE_FILE not found.${NC}"
                 fi
                 echo -ne "\n  ${DIM}Press any key...${NC}"; read -n 1 ;;
-            0) return ;;
+            0|q|Q) return ;;
             *) echo -e "  ${RED}Invalid option.${NC}"; sleep 1 ;;
         esac
     done
@@ -2610,7 +2675,7 @@ nat_manager() {
                     echo -e "  ${DIM}Cancelled.${NC}"
                 fi
                 echo -ne "\n  ${DIM}Press any key...${NC}"; read -n 1 ;;
-            0) return ;;
+            0|q|Q) return ;;
             *) echo -e "  ${RED}Invalid option.${NC}"; sleep 1 ;;
         esac
     done
@@ -2637,7 +2702,7 @@ mtr_tool() {
                 yum install -y mtr 2>/dev/null || \
                 dnf install -y mtr 2>/dev/null
                 echo -ne "\n  ${DIM}Press any key...${NC}"; read -n 1 ;;
-            0) return ;;
+            0|q|Q) return ;;
         esac
         return
     fi
@@ -2659,7 +2724,7 @@ mtr_tool() {
             echo -e "\n  ${CYAN}[*] MTR report for $MTR_HOST (10 cycles)...${NC}\n"
             mtr -r -c 10 "$MTR_HOST" 2>&1 | while IFS= read -r l; do echo "  $l"; done
             echo -ne "\n  ${DIM}Press any key...${NC}"; read -n 1 ;;
-        0) return ;;
+        0|q|Q) return ;;
         *) echo -e "  ${RED}Invalid.${NC}"; sleep 1 ;;
     esac
 }
@@ -2732,7 +2797,7 @@ mtu_finder() {
                 printf "  %-16s MTU: %s\n", iface, mtu
             }' | head -20
             echo -ne "\n  ${DIM}Press any key...${NC}"; read -n 1 ;;
-        0) return ;;
+        0|q|Q) return ;;
         *) echo -e "  ${RED}Invalid.${NC}"; sleep 1 ;;
     esac
 }
@@ -2839,7 +2904,7 @@ bbr_manager() {
                     echo -e "  ${RED}[ERR] BBR not available. Kernel >= 4.9 required.${NC}"
                 fi
                 echo -ne "\n  ${DIM}Press any key...${NC}"; read -n 1 ;;
-            0) return ;;
+            0|q|Q) return ;;
             *) echo -e "  ${RED}Invalid option.${NC}"; sleep 1 ;;
         esac
     done
@@ -2927,7 +2992,7 @@ menu_system() {
             4) system_update 4 ;;
             5) system_update 5 ;;
             6) repository_manager ;;
-            0) return ;;
+            0|q|Q) return ;;
             *) echo -e "  ${RED}Invalid option.${NC}"; sleep 1 ;;
         esac
     done
@@ -2960,7 +3025,7 @@ iftop_monitor() {
                     echo -e "  ${RED}[ERR] No supported package manager found.${NC}"
                 fi
                 echo -ne "\n  ${DIM}Press any key...${NC}"; read -n 1 ;;
-            0) return ;;
+            0|q|Q) return ;;
         esac
         return
     fi
@@ -3008,7 +3073,7 @@ iftop_monitor() {
                 iftop -n 2>/dev/null
             fi
             echo -ne "\n  ${DIM}Press any key to return...${NC}"; read -n 1 ;;
-        0) return ;;
+        0|q|Q) return ;;
         *) echo -e "  ${RED}Invalid.${NC}"; sleep 1 ;;
     esac
 }
@@ -3396,7 +3461,7 @@ repository_manager() {
                 echo -ne "\n  ${DIM}Press any key...${NC}"; read -n 1
                 ;;
 
-            0) return ;;
+            0|q|Q) return ;;
             *) echo -e "  ${RED}Invalid option.${NC}"; sleep 1 ;;
         esac
     done
@@ -3425,7 +3490,7 @@ menu_monitoring() {
             3) system_resources ;;
             4) iftop_monitor ;;
             5) speed_test ;;
-            0) return ;;
+            0|q|Q) return ;;
             *) echo -e "  ${RED}Invalid option.${NC}"; sleep 1 ;;
         esac
     done
@@ -3476,7 +3541,7 @@ ufw_install_manager() {
                         echo -e "\n  ${RED}[ERR] Installation failed.${NC}"
                     fi
                     echo -ne "\n  ${DIM}Press any key...${NC}"; read -n 1 ;;
-                0) return ;;
+                0|q|Q) return ;;
             esac; continue
         fi
 
@@ -3606,7 +3671,7 @@ ufw_install_manager() {
                 else
                     echo -e "  ${DIM}Cancelled.${NC}"; sleep 1
                 fi ;;
-            0) return ;;
+            0|q|Q) return ;;
             *) echo -e "  ${RED}Invalid option.${NC}"; sleep 1 ;;
         esac
     done
@@ -3669,7 +3734,7 @@ menu_network() {
             4) mtr_tool ;;
             5) mtu_finder ;;
             6) bbr_manager ;;
-            0) return ;;
+            0|q|Q) return ;;
             *) echo -e "  ${RED}Invalid option.${NC}"; sleep 1 ;;
         esac
     done
@@ -3697,7 +3762,7 @@ menu_security() {
             3) nat_manager ;;
             4) ufw_install_manager ;;
             5) fail2ban_manager ;;
-            0) return ;;
+            0|q|Q) return ;;
             *) echo -e "  ${RED}Invalid option.${NC}"; sleep 1 ;;
         esac
     done
@@ -3989,7 +4054,7 @@ _np_backup_restore_menu() {
                 [ -s "$LIST" ] || echo "No backups yet." > "$LIST"
                 _np_textbox "Backups" "$LIST"
                 rm -f "$LIST" ;;
-            0) return ;;
+            0|q|Q) return ;;
         esac
     done
 }
@@ -4033,7 +4098,7 @@ _np_apply_menu() {
                     netplan apply 2>&1
                     echo -ne "\n  ${DIM}Press any key...${NC}"; read -n 1
                 fi ;;
-            0) return ;;
+            0|q|Q) return ;;
         esac
     done
 }
@@ -4151,7 +4216,7 @@ _np_manage_routes() {
                 done
                 NP_ROUTES="$NEW"
                 _np_save_iface "$IFACE"; _np_rebuild_yaml ;;
-            0) return ;;
+            0|q|Q) return ;;
         esac
     done
 }
@@ -4254,7 +4319,7 @@ menu_netplan() {
             6) _np_view_others ;;
             7) _np_apply_menu ;;
             8) _np_backup_restore_menu ;;
-            0) return ;;
+            0|q|Q) return ;;
         esac
     done
 }
@@ -4277,7 +4342,7 @@ menu_panel() {
             1) ssl_checker ;;
             2) install_xui ;;
             3) check_web_ports ;;
-            0) return ;;
+            0|q|Q) return ;;
             *) echo -e "  ${RED}Invalid option.${NC}"; sleep 1 ;;
         esac
     done
@@ -5072,12 +5137,12 @@ Host: <code>$(hostname)</code>" "HTML"
                                 echo -e "  ${GREEN}[OK] Auto-send stopped.${NC}" || \
                                 echo -e "  ${YELLOW}[!] Was not running.${NC}"
                             sleep 2 ;;
-                        0) break ;;
+                        0|q|Q) break ;;
                         *) echo -e "  ${RED}Invalid.${NC}"; sleep 1 ;;
                     esac
                 done ;;
 
-            0) return ;;
+            0|q|Q) return ;;
             *) echo -e "  ${RED}Invalid option.${NC}"; sleep 1 ;;
         esac
         _tg_load_cfg
@@ -5847,7 +5912,7 @@ menu_telegram_bot() {
                 fi
                 echo ""; sep_bot; echo ""
                 echo -ne "  ${DIM}Press any key...${NC}"; read -n 1 ;;
-            0) return ;;
+            0|q|Q) return ;;
             *) echo -e "  ${RED}Invalid option.${NC}"; sleep 1 ;;
         esac
         _tgb_load
@@ -5866,7 +5931,7 @@ while true; do
         5)  user_manager ;;
         6)  menu_panel ;;
         7)  menu_telegram_bot ;;
-        0)  clear; echo -e "  ${DIM}Goodbye.${NC}"; echo ""; exit 0 ;;
+        0|q|Q)  clear; echo -e "  ${DIM}Goodbye.${NC}"; echo ""; exit 0 ;;
         *)  echo -e "  ${RED}Invalid option.${NC}"; sleep 1 ;;
     esac
 done
