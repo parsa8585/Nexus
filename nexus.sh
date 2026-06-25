@@ -63,16 +63,36 @@ _curl() {
 get_server_info() {
     SRV_HOSTNAME=$(hostname 2>/dev/null || echo "N/A")
 
-    # IPv4 — try multiple sources
-    SRV_IP4=$(_curl -4 ifconfig.me)
-    [ -z "$SRV_IP4" ] && SRV_IP4=$(_curl api.ipify.org)
-    [ -z "$SRV_IP4" ] && SRV_IP4=$(ip route get 1.1.1.1 2>/dev/null | awk '/src/{print $7}' | head -1)
+    # Helper: validate IPv4 format
+    _valid_ip4() {
+        echo "$1" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+    }
+    # Helper: validate IPv6 format
+    _valid_ip6() {
+        echo "$1" | grep -qE '^([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}$'
+    }
+
+    # IPv4 — try multiple sources, validate each result
+    _raw=$(_curl -4 ifconfig.me); _valid_ip4 "$_raw" && SRV_IP4="$_raw" || SRV_IP4=""
+    if [ -z "$SRV_IP4" ]; then
+        _raw=$(_curl api.ipify.org); _valid_ip4 "$_raw" && SRV_IP4="$_raw" || SRV_IP4=""
+    fi
+    if [ -z "$SRV_IP4" ]; then
+        _raw=$(_curl -4 icanhazip.com | tr -d '[:space:]'); _valid_ip4 "$_raw" && SRV_IP4="$_raw" || SRV_IP4=""
+    fi
+    if [ -z "$SRV_IP4" ]; then
+        _raw=$(ip route get 1.1.1.1 2>/dev/null | awk '/src/{print $7}' | head -1)
+        _valid_ip4 "$_raw" && SRV_IP4="$_raw" || SRV_IP4=""
+    fi
     [ -z "$SRV_IP4" ] && SRV_IP4="N/A"
 
-    # IPv6
-    SRV_IP6=$(_curl -6 ifconfig.me)
-    [ -z "$SRV_IP6" ] && SRV_IP6=$(ip -6 addr show scope global 2>/dev/null \
-        | grep -oE '([0-9a-f]{0,4}:){2,7}[0-9a-f]{0,4}' | head -1)
+    # IPv6 — validate result
+    _raw=$(_curl -6 ifconfig.me); _valid_ip6 "$_raw" && SRV_IP6="$_raw" || SRV_IP6=""
+    if [ -z "$SRV_IP6" ]; then
+        _raw=$(ip -6 addr show scope global 2>/dev/null \
+            | grep -oE '([0-9a-f]{0,4}:){2,7}[0-9a-f]{0,4}' | head -1)
+        _valid_ip6 "$_raw" && SRV_IP6="$_raw" || SRV_IP6=""
+    fi
     [ -z "$SRV_IP6" ] && SRV_IP6="N/A"
 
     SRV_OS=$(grep PRETTY_NAME /etc/os-release 2>/dev/null | cut -d'"' -f2 || uname -s)
@@ -81,10 +101,20 @@ get_server_info() {
     [ -z "$SRV_UPTIME" ] && SRV_UPTIME="N/A"
     SRV_LOAD=$(awk '{print $1}' /proc/loadavg 2>/dev/null || echo "N/A")
 
-    # Country
+    # Country — validate: must be plain text, no HTML tags
     if [ "$SRV_IP4" != "N/A" ]; then
-        SRV_COUNTRY=$(_curl "http://ip-api.com/line/${SRV_IP4}?fields=country")
-        [ -z "$SRV_COUNTRY" ] && SRV_COUNTRY="Unknown"
+        _raw=$(_curl "http://ip-api.com/line/${SRV_IP4}?fields=country")
+        # Reject if contains HTML or is longer than 60 chars
+        if [ -n "$_raw" ] && ! echo "$_raw" | grep -q '<' && [ "${#_raw}" -lt 60 ]; then
+            SRV_COUNTRY="$_raw"
+        else
+            _raw=$(_curl "https://ipinfo.io/${SRV_IP4}/country" | tr -d '[:space:]')
+            if [ -n "$_raw" ] && ! echo "$_raw" | grep -q '<' && [ "${#_raw}" -le 3 ]; then
+                SRV_COUNTRY="$_raw"
+            else
+                SRV_COUNTRY="Unknown"
+            fi
+        fi
     else
         SRV_COUNTRY="Unknown"
     fi
@@ -746,6 +776,7 @@ modify_user() {
         row "   4.  Change Username"
         row "   5.  Change Password"
         row "   6.  Change Shell"
+        row "   7.  Enable / Disable User"
         row "   0.  Back"
         row ""
         sep_bot
@@ -943,6 +974,52 @@ modify_user() {
                 else
                     echo -e "  ${RED}[ERR] Failed. Shell path may not exist.${NC}"
                 fi
+                echo -ne "\n  ${DIM}Press any key...${NC}"; read -n 1
+                ;;
+            7)
+                clear
+                sep_top; row "        Enable / Disable User"; sep_bot; echo ""
+                echo -ne "  ${YELLOW}Username : ${NC}"; read -r TGUSER
+                [ -z "$TGUSER" ] && continue
+                if ! id "$TGUSER" &>/dev/null; then
+                    echo -e "  ${RED}User '$TGUSER' not found.${NC}"; sleep 2; continue
+                fi
+                if [ "$TGUSER" = "root" ]; then
+                    echo -e "  ${RED}[ERR] Cannot disable root.${NC}"; sleep 2; continue
+                fi
+                if [ "$TGUSER" = "$(whoami)" ]; then
+                    echo -e "  ${RED}[ERR] Cannot disable yourself.${NC}"; sleep 2; continue
+                fi
+                # Check current lock status
+                LOCK_STATUS=$(passwd -S "$TGUSER" 2>/dev/null | awk '{print $2}')
+                echo ""
+                if [ "$LOCK_STATUS" = "L" ] || [ "$LOCK_STATUS" = "LK" ]; then
+                    rowc 44 "  Status : ${RED}● Disabled (locked)${NC}"
+                else
+                    rowc 46 "  Status : ${GREEN}● Enabled (active)${NC}"
+                fi
+                echo ""
+                echo -e "   1. Enable user  (unlock)"
+                echo -e "   2. Disable user (lock)"
+                echo -ne "\n  ${YELLOW}> Select: ${NC}"
+                read -n 1 TGOPT; echo ""
+                case $TGOPT in
+                    1)
+                        if usermod -U "$TGUSER" 2>/dev/null && usermod -s /bin/bash "$TGUSER" 2>/dev/null; then
+                            echo -e "  ${GREEN}[OK] User '$TGUSER' has been enabled.${NC}"
+                        else
+                            echo -e "  ${RED}[ERR] Failed to enable user.${NC}"
+                        fi ;;
+                    2)
+                        pkill -9 -u "$TGUSER" 2>/dev/null || true
+                        if usermod -L "$TGUSER" 2>/dev/null && usermod -s /usr/sbin/nologin "$TGUSER" 2>/dev/null; then
+                            echo -e "  ${GREEN}[OK] User '$TGUSER' has been disabled.${NC}"
+                            echo -e "  ${DIM}Active sessions terminated.${NC}"
+                        else
+                            echo -e "  ${RED}[ERR] Failed to disable user.${NC}"
+                        fi ;;
+                    *) echo -e "  ${DIM}Cancelled.${NC}" ;;
+                esac
                 echo -ne "\n  ${DIM}Press any key...${NC}"; read -n 1
                 ;;
             0) return ;;
