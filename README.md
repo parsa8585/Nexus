@@ -37,7 +37,7 @@
 ## ⚡ Quick Install (One-liner)
 
 ```bash
-bash <(curl -s https://raw.githubusercontent.com/parsa8585/nexus/main/install.sh)
+bash <(curl -s https://raw.githubusercontent.com/YOUR_USERNAME/nexus/main/install.sh)
 ```
 
 
@@ -47,7 +47,7 @@ bash <(curl -s https://raw.githubusercontent.com/parsa8585/nexus/main/install.sh
 
 ```bash
 # Clone the repo
-git clone https://github.com/parsa8585/nexus.git
+git clone https://github.com/YOUR_USERNAME/nexus.git
 cd nexus
 
 # Make executable
@@ -111,6 +111,16 @@ sudo bash nexus.sh
 4. Find your `chat_id`
 5. In Nexus → **Telegram Bot Panel** → option **1** → enter token & chat ID
 6. Start polling → receive live server stats on Telegram
+
+---
+
+## 🗑️ Uninstall
+
+```bash
+sudo rm -f /usr/local/bin/nexus
+```
+
+That's it — no config files or dependencies are left behind.
 
 ---
 
