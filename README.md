@@ -40,7 +40,6 @@
 bash <(curl -s https://raw.githubusercontent.com/parsa8585/nexus/main/install.sh)
 ```
 
-> Replace `YOUR_USERNAME` with your GitHub username after uploading.
 
 ---
 
