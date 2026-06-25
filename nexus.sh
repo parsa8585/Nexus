@@ -268,57 +268,67 @@ ssh_monitor() {
     tput smcup 2>/dev/null; tput civis 2>/dev/null
     trap 'tput rmcup 2>/dev/null; tput cnorm 2>/dev/null; return' INT
 
+    # مقادیر ثابت رو یه بار خارج از لوپ حساب کن
+    local _HZ _BOOT
+    _HZ=$(getconf CLK_TCK 2>/dev/null || echo 100)
+    _BOOT=$(awk '/^btime/{print $2}' /proc/stat 2>/dev/null)
+
     while true; do
-        unset SESSION_LINES
+        unset SESSION_LINES _SEEN_CONN
         declare -a SESSION_LINES=()
-        declare -A _SEEN_CONN  # جلوگیری از duplicate: key=user|ip
+        declare -A _SEEN_CONN=()
 
-        # ── منبع حقیقت: /proc/PID/environ با SSH_CONNECTION
-        # SSH_CONNECTION فقط بعد از احراز هویت موفق set میشه
-        # brute-forceها و pre-auth connectionها این متغیر رو ندارن
+        local _today
+        _today=$(date '+%m-%d')
+
+        # ── SSH_CONNECTION در environ = احراز هویت شده
+        # brute-force و pre-auth این متغیر رو ندارن
         while IFS= read -r _pid_dir; do
+            local _pid
             _pid=$(basename "$_pid_dir")
-            # فقط sshd processها
-            [[ "$(cat /proc/${_pid}/comm 2>/dev/null)" != "sshd" ]] && continue
 
-            # SSH_CONNECTION رو از environ بخون (null-separated)
-            _env_file="/proc/${_pid}/environ"
+            # فقط sshd
+            [[ "$(cat "/proc/${_pid}/comm" 2>/dev/null)" != "sshd" ]] && continue
+
+            # environ رو بخون — فقط root میتونه environ بقیه رو بخونه
+            local _env_file="/proc/${_pid}/environ"
             [ ! -r "$_env_file" ] && continue
+
+            local _ssh_conn
             _ssh_conn=$(tr '\0' '\n' < "$_env_file" 2>/dev/null | grep '^SSH_CONNECTION=' | head -1)
             [ -z "$_ssh_conn" ] && continue
-            # SSH_CONNECTION=<client_ip> <client_port> <server_ip> <server_port>
+
+            # IP کلاینت = فیلد اول SSH_CONNECTION
+            local _rip
             _rip=$(echo "$_ssh_conn" | cut -d= -f2 | awk '{print $1}')
-            [ -z "$_rip" ] && continue
+            [ -z "$_rip" ]         && continue
             [[ "$_rip" == "127."* ]] && continue
             [[ "$_rip" == "::1" ]]   && continue
 
-            # username از UID
+            # username
+            local _uid _uname
             _uid=$(awk '/^Uid:/{print $2;exit}' "/proc/${_pid}/status" 2>/dev/null)
             [ -z "$_uid" ] && continue
             _uname=$(getent passwd "$_uid" 2>/dev/null | cut -d: -f1)
             [ -z "$_uname" ] && continue
-            # root رو نشون نده
-            [[ "$_uname" == "root" ]] && continue
 
-            # duplicate: یه user از یه IP فقط یه بار
-            _conn_key="${_uname}|${_rip}"
+            # یه user میتونه از چند IP وصل باشه → key = user+IP
+            local _conn_key="${_uname}|${_rip}"
             [ -n "${_SEEN_CONN[$_conn_key]}" ] && continue
             _SEEN_CONN["$_conn_key"]=1
 
-            # login time از /proc/PID/stat فیلد 22
-            _start_j=$(awk '{print $22}' "/proc/${_pid}/stat" 2>/dev/null)
-            _hz=$(getconf CLK_TCK 2>/dev/null || echo 100)
-            _boot=$(awk '/^btime/{print $2}' /proc/stat 2>/dev/null)
-            _login_ts=$(( _boot + _start_j / _hz ))
+            # login time
+            local _start_j _login_ts _login_str
+            _start_j=$(awk '{print $22}' "/proc/${_pid}/stat" 2>/dev/null || echo 0)
+            _login_ts=$(( _BOOT + _start_j / _HZ ))
             _login_str=$(date -d "@${_login_ts}" '+%m-%d %H:%M' 2>/dev/null || echo "-")
-            _today=$(date '+%m-%d')
-            [[ "$_login_str" == ${_today}* ]] && _login_str=$(echo "$_login_str" | awk '{print $2}')
+            [[ "$_login_str" == "${_today}"* ]] && _login_str="${_login_str##* }"
 
             SESSION_LINES+=("${_uname}|${_rip}|${_login_str}")
         done < <(ls -d /proc/[0-9]* 2>/dev/null)
 
         unset _SEEN_CONN
-        COUNT=${#SESSION_LINES[@]}
+        local COUNT=${#SESSION_LINES[@]}
 
         OUT=""
         OUT+="$(sep_top)"$'\n'
