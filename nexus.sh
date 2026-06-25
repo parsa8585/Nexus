@@ -269,42 +269,52 @@ ssh_monitor() {
     trap 'tput rmcup 2>/dev/null; tput cnorm 2>/dev/null; return' INT
 
     while true; do
-        declare -A TTY_IP TTY_LOGIN TTY_IDLE PTY_IP_MAP
+        # ── کاربرا shell نمی‌گیرن — فقط tunnel دارن
+        # پس who/w فقط root رو نشون می‌ده
+        # باید از ss port:22 + PID→username بخونیم
 
-        # ── who: همه sessions (بدون فیلتر) ──────────────────────
-        while IFS= read -r _wl; do
-            _wt=$(echo "$_wl" | awk '{print $2}')
-            [ -z "$_wt" ] && continue
-            _wip=$(echo "$_wl" | grep -oE '\([^)]+\)' | tr -d '()')
-            _wdt=$(echo "$_wl" | awk '{print $3, $4}')
-            TTY_LOGIN["$_wt"]="$_wdt"
-            [ -n "$_wip" ] && TTY_IP["$_wt"]="$_wip"
-        done < <(who 2>/dev/null || true)
+        declare -A SEEN_PID  # جلوگیری از duplicate (parent+child یه PID دارن)
 
-        # ── w: IDLE time ─────────────────────────────────────────
-        while IFS= read -r _wl; do
-            _wt=$(echo "$_wl" | awk '{print $2}')
-            _wi=$(echo "$_wl" | awk '{print $5}')
-            [ -n "$_wt" ] && TTY_IDLE["$_wt"]="$_wi"
-        done < <(w -h 2>/dev/null || true)
+        _get_user_for_pid() {
+            local pid="$1"
+            # از /proc/PID/status خط Uid رو بخون → getent passwd
+            local uid
+            uid=$(awk '/^Uid:/{print $2; exit}' "/proc/${pid}/status" 2>/dev/null)
+            [ -z "$uid" ] && return
+            getent passwd "$uid" 2>/dev/null | cut -d: -f1
+        }
 
-        # ── IP از /proc: SSH_TTY + SSH_CLIENT ────────────────────
-        for _pid_env in /proc/[0-9]*/environ; do
-            _p="${_pid_env%/environ}"; _p="${_p##*/proc/}"
-            [ -z "$_p" ] && continue
-            _cmd=$(cat "/proc/${_p}/comm" 2>/dev/null) || continue
-            [ "$_cmd" != "sshd" ] && continue
-            _env=$(tr '\0' '\n' < "/proc/${_p}/environ" 2>/dev/null) || continue
-            _sc=$(echo "$_env" | grep '^SSH_CLIENT=' | cut -d= -f2 | awk '{print $1}')
-            [ -z "$_sc" ] && continue
-            echo "$_sc" | grep -qE '^127\.' && continue
-            _stty=$(echo "$_env" | grep '^SSH_TTY=' | cut -d= -f2 | sed 's|/dev/||')
-            [ -n "$_stty" ] && PTY_IP_MAP["$_stty"]="$_sc"
-        done
+        # لیست sessions: ss port 22، هر خط یه connection
+        declare -a SESSION_LINES=()
+        while IFS= read -r _sl; do
+            # فقط خطوطی که local port 22 دارن
+            _local=$(echo "$_sl" | awk '{print $4}')
+            echo "$_local" | grep -qE ':22$' || continue
+            # remote IP
+            _remote=$(echo "$_sl" | awk '{print $5}')
+            _rip=$(echo "$_remote" | rev | cut -d: -f2- | rev)
+            # PIDs — ممکنه دو تا PID باشه (parent,child): اولی child هست
+            _pids=$(echo "$_sl" | grep -oE 'pid=[0-9]+' | grep -oE '[0-9]+')
+            _pid=$(echo "$_pids" | head -1)
+            [ -z "$_pid" ] && continue
+            # اگه این PID رو قبلاً دیدیم skip کن
+            [ -n "${SEEN_PID[$_pid]}" ] && continue
+            SEEN_PID["$_pid"]=1
+            _uname=$(_get_user_for_pid "$_pid")
+            [ -z "$_uname" ] && continue
+            # login time از /proc/PID/stat فیلد 22 (starttime در jiffies)
+            _start_j=$(awk '{print $22}' "/proc/${_pid}/stat" 2>/dev/null)
+            _hz=$(getconf CLK_TCK 2>/dev/null || echo 100)
+            _boot=$(awk '/^btime/{print $2}' /proc/stat 2>/dev/null)
+            _login_ts=$(( _boot + _start_j / _hz ))
+            _login_str=$(date -d "@${_login_ts}" '+%m-%d %H:%M' 2>/dev/null || echo "-")
+            # اگه امروز فقط HH:MM
+            _today=$(date '+%m-%d')
+            echo "$_login_str" | grep -q "^${_today}" && _login_str=$(echo "$_login_str" | awk '{print $2}')
+            SESSION_LINES+=("${_uname}|${_rip}|${_login_str}")
+        done < <(ss -tnp 2>/dev/null | grep 'sshd' || true)
 
-        # ── لیست نهایی از who بدون هیچ فیلتری ──────────────────
-        mapfile -t WHO_LINES < <(who 2>/dev/null || true)
-        COUNT=${#WHO_LINES[@]}
+        COUNT=${#SESSION_LINES[@]}
 
         OUT=""
         OUT+="$(sep_top)"$'\n'
@@ -313,45 +323,24 @@ ssh_monitor() {
         OUT+="$(sep_mid)"$'\n'
         OUT+="$(row "  Online: $COUNT")"$'\n'
         OUT+="$(sep_mid)"$'\n'
-        OUT+="$(row "  USER       IP              LOGIN        IDLE")"$'\n'
+        OUT+="$(row "  USER       IP              LOGIN")"$'\n'
         OUT+="$(sep_mid)"$'\n'
 
         if [ "$COUNT" -eq 0 ]; then
             OUT+="$(row "  No active SSH sessions")"$'\n'
         else
-            for _wl in "${WHO_LINES[@]}"; do
-                U=$(echo "$_wl"   | awk '{print $1}')
-                TTY=$(echo "$_wl" | awk '{print $2}')
-
-                # IP: proc/SSH_TTY map (per-PTY, most accurate) → who parentheses
-                if [ -n "${PTY_IP_MAP[$TTY]}" ]; then
-                    IP="${PTY_IP_MAP[$TTY]}"
-                elif [ -n "${TTY_IP[$TTY]}" ]; then
-                    IP="${TTY_IP[$TTY]}"
-                else
-                    IP="-"
-                fi
-
-                # Login time: HH:MM if today, else MM-DD HH:MM
-                LOGIN="${TTY_LOGIN[$TTY]:-}"
-                _ldate=$(echo "$LOGIN" | awk '{print $1}')
-                _ltime=$(echo "$LOGIN" | awk '{print $2}' | cut -c1-5)
-                if [ "$_ldate" = "$(date '+%Y-%m-%d')" ]; then
-                    LOGIN="$_ltime"
-                else
-                    LOGIN=$(date -d "$_ldate" '+%m-%d' 2>/dev/null || echo "$_ldate" | cut -c6-10)" $_ltime"
-                fi
-
-                IDLE="${TTY_IDLE[$TTY]:-}"
-
-                LINE=$(printf "  %-10s%-16s%-13s%s" \
-                    "${U:0:9}" "${IP:0:15}" "${LOGIN:0:12}" "${IDLE:0:6}")
+            for _entry in "${SESSION_LINES[@]}"; do
+                U=$(echo "$_entry"     | cut -d'|' -f1)
+                IP=$(echo "$_entry"    | cut -d'|' -f2)
+                LOGIN=$(echo "$_entry" | cut -d'|' -f3)
+                LINE=$(printf "  %-10s%-16s%s" \
+                    "${U:0:9}" "${IP:0:15}" "${LOGIN:0:11}")
                 OUT+="$(row "$LINE")"$'\n'
             done
         fi
         OUT+="$(sep_bot)"$'\n'
 
-        unset TTY_IP TTY_LOGIN TTY_IDLE PTY_IP_MAP WHO_LINES
+        unset SEEN_PID SESSION_LINES
 
         tput cup 0 0 2>/dev/null
         printf '%s' "$OUT"
