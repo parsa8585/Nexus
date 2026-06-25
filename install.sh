@@ -4,7 +4,7 @@
 
 set -e
 
-REPO_URL="https://raw.githubusercontent.com/YOUR_USERNAME/nexus/main"
+REPO_URL="https://raw.githubusercontent.com/parsa8585/nexus/main"
 INSTALL_PATH="/usr/local/bin/nexus"
 
 RED='\033[0;31m'
