@@ -268,66 +268,130 @@ ssh_monitor() {
     tput smcup 2>/dev/null; tput civis 2>/dev/null
     trap 'tput rmcup 2>/dev/null; tput cnorm 2>/dev/null; return' INT
 
-    # مقادیر ثابت رو یه بار خارج از لوپ حساب کن
     local _HZ _BOOT
     _HZ=$(getconf CLK_TCK 2>/dev/null || echo 100)
     _BOOT=$(awk '/^btime/{print $2}' /proc/stat 2>/dev/null)
 
     while true; do
-        unset SESSION_LINES _SEEN_CONN
+        unset SESSION_LINES _SEEN
         declare -a SESSION_LINES=()
-        declare -A _SEEN_CONN=()
+        declare -A _SEEN=()
 
-        local _today
-        _today=$(date '+%m-%d')
+        # ── روش اصلی: ss -tnp روی port 22 ─────────────────────────
+        # ss با root همه PIDs رو میده
+        # هر خط ESTAB روی :22 = یه connection فعال
+        declare -A _PID_IP=()
+        while IFS= read -r _line; do
+            # فقط ESTAB
+            [[ "$_line" == ESTAB* ]] || continue
+            # local addr باید port 22 باشه
+            local _laddr _raddr _pid _rip
+            _laddr=$(echo "$_line" | awk '{print $4}')
+            echo "$_laddr" | grep -qE ':22$' || continue
+            _raddr=$(echo "$_line" | awk '{print $5}')
+            # IP رو از آدرس جدا کن (IPv4: 1.2.3.4:port  IPv6: [::]:port)
+            _rip=$(echo "$_raddr" | sed 's/\[//g;s/\]//g' | rev | cut -d: -f2- | rev)
+            [[ "$_rip" == "127."*  ]] && continue
+            [[ "$_rip" == "::1"    ]] && continue
+            [ -z "$_rip"           ] && continue
+            _pid=$(echo "$_line" | grep -oE 'pid=[0-9]+' | grep -oE '[0-9]+' | head -1)
+            [ -n "$_pid" ] && _PID_IP["$_pid"]="$_rip"
+        done < <(ss -tnp 2>/dev/null)
 
-        # ── SSH_CONNECTION در environ = احراز هویت شده
-        # brute-force و pre-auth این متغیر رو ندارن
-        while IFS= read -r _pid_dir; do
-            local _pid
-            _pid=$(basename "$_pid_dir")
+        # اگه ss هیچ PID نداد (kernel محدودیت داشت)،
+        # از /proc/net/tcp و tcp6 مستقیم بخون
+        if [ ${#_PID_IP[@]} -eq 0 ]; then
+            # /proc/net/tcp: hex local_addr remote_addr state uid inode
+            # state=01 = ESTABLISHED, local port باید 0016 (hex 22) باشه
+            while IFS= read -r _tline; do
+                local _lhex _rhex _state _inode _rip _h
+                _lhex=$(echo "$_tline" | awk '{print $2}')
+                _rhex=$(echo "$_tline" | awk '{print $3}')
+                _state=$(echo "$_tline" | awk '{print $4}')
+                _inode=$(echo "$_tline" | awk '{print $10}')
+                [[ "$_state" != "01" ]] && continue
+                # local port = آخرین 4 کاراکتر lhex باید 0016 باشه
+                [[ "${_lhex##*:}" != "0016" ]] && continue
+                # remote IP از hex (little-endian)
+                _h="${_rhex%%:*}"
+                _rip=$(printf '%d.%d.%d.%d' \
+                    0x${_h:6:2} 0x${_h:4:2} 0x${_h:2:2} 0x${_h:0:2})
+                [[ "$_rip" == "127."* ]] && continue
+                # پیدا کردن PID از inode
+                local _pid
+                _pid=$(grep -rl "socket:\[${_inode}\]" /proc/*/fd 2>/dev/null \
+                       | grep -oE '/proc/[0-9]+/' | grep -oE '[0-9]+' | head -1)
+                [ -n "$_pid" ] && _PID_IP["$_pid"]="$_rip"
+            done < /proc/net/tcp 2>/dev/null
+
+            # tcp6 برای IPv6 و IPv4-mapped
+            while IFS= read -r _tline; do
+                local _lhex _rhex _state _inode _hexip _h _rip
+                _lhex=$(echo "$_tline" | awk '{print $2}')
+                _rhex=$(echo "$_tline" | awk '{print $3}')
+                _state=$(echo "$_tline" | awk '{print $4}')
+                _inode=$(echo "$_tline" | awk '{print $10}')
+                [[ "$_state" != "01" ]] && continue
+                [[ "${_lhex##*:}" != "0016" ]] && continue
+                _hexip="${_rhex%%:*}"
+                # IPv4-mapped: 00000000000000000000FFFF + 8hex
+                if [[ "$_hexip" =~ ^0{20}FFFF(.{8})$ ]]; then
+                    _h="${BASH_REMATCH[1]}"
+                    _rip=$(printf '%d.%d.%d.%d' \
+                        0x${_h:6:2} 0x${_h:4:2} 0x${_h:2:2} 0x${_h:0:2})
+                    [[ "$_rip" == "127."* ]] && continue
+                    local _pid
+                    _pid=$(grep -rl "socket:\[${_inode}\]" /proc/*/fd 2>/dev/null \
+                           | grep -oE '/proc/[0-9]+/' | grep -oE '[0-9]+' | head -1)
+                    [ -n "$_pid" ] && _PID_IP["$_pid"]="$_rip"
+                fi
+            done < /proc/net/tcp6 2>/dev/null
+        fi
+
+        # ── حالا از PID → username + login time ────────────────────
+        for _pid in "${!_PID_IP[@]}"; do
+            local _rip="${_PID_IP[$_pid]}"
 
             # فقط sshd
             [[ "$(cat "/proc/${_pid}/comm" 2>/dev/null)" != "sshd" ]] && continue
 
-            # environ رو بخون — فقط root میتونه environ بقیه رو بخونه
-            local _env_file="/proc/${_pid}/environ"
-            [ ! -r "$_env_file" ] && continue
-
-            local _ssh_conn
-            _ssh_conn=$(tr '\0' '\n' < "$_env_file" 2>/dev/null | grep '^SSH_CONNECTION=' | head -1)
-            [ -z "$_ssh_conn" ] && continue
-
-            # IP کلاینت = فیلد اول SSH_CONNECTION
-            local _rip
-            _rip=$(echo "$_ssh_conn" | cut -d= -f2 | awk '{print $1}')
-            [ -z "$_rip" ]         && continue
-            [[ "$_rip" == "127."* ]] && continue
-            [[ "$_rip" == "::1" ]]   && continue
-
-            # username
+            # username از UID
             local _uid _uname
             _uid=$(awk '/^Uid:/{print $2;exit}' "/proc/${_pid}/status" 2>/dev/null)
             [ -z "$_uid" ] && continue
             _uname=$(getent passwd "$_uid" 2>/dev/null | cut -d: -f1)
             [ -z "$_uname" ] && continue
 
-            # یه user میتونه از چند IP وصل باشه → key = user+IP
-            local _conn_key="${_uname}|${_rip}"
-            [ -n "${_SEEN_CONN[$_conn_key]}" ] && continue
-            _SEEN_CONN["$_conn_key"]=1
+            # اگه sshd هنوز root هست (pre-auth)، username رو از child بگیر
+            if [[ "$_uname" == "root" ]]; then
+                # child process این sshd رو پیدا کن
+                local _child_uid _child_uname
+                _child_uid=$(awk -v pp="$_pid" \
+                    '/^PPid:/{if($2==pp) found=1} found && /^Uid:/{print $2;exit}' \
+                    /proc/*/status 2>/dev/null | head -1)
+                if [ -n "$_child_uid" ] && [ "$_child_uid" != "0" ]; then
+                    _child_uname=$(getent passwd "$_child_uid" 2>/dev/null | cut -d: -f1)
+                    [ -n "$_child_uname" ] && _uname="$_child_uname"
+                fi
+            fi
+
+            # duplicate: user|IP
+            local _key="${_uname}|${_rip}"
+            [ -n "${_SEEN[$_key]}" ] && continue
+            _SEEN["$_key"]=1
 
             # login time
-            local _start_j _login_ts _login_str
+            local _start_j _login_ts _login_str _today
+            _today=$(date '+%m-%d')
             _start_j=$(awk '{print $22}' "/proc/${_pid}/stat" 2>/dev/null || echo 0)
             _login_ts=$(( _BOOT + _start_j / _HZ ))
             _login_str=$(date -d "@${_login_ts}" '+%m-%d %H:%M' 2>/dev/null || echo "-")
             [[ "$_login_str" == "${_today}"* ]] && _login_str="${_login_str##* }"
 
             SESSION_LINES+=("${_uname}|${_rip}|${_login_str}")
-        done < <(ls -d /proc/[0-9]* 2>/dev/null)
+        done
+        unset _PID_IP _SEEN
 
-        unset _SEEN_CONN
         local COUNT=${#SESSION_LINES[@]}
 
         OUT=""
