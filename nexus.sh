@@ -269,10 +269,9 @@ ssh_monitor() {
     trap 'tput rmcup 2>/dev/null; tput cnorm 2>/dev/null; return' INT
 
     while true; do
-        # ── Collect active sessions from who (all pts lines) ──────
-        declare -A TTY_IP TTY_LOGIN TTY_IDLE
+        declare -A TTY_IP TTY_LOGIN TTY_IDLE PTY_IP_MAP
 
-        # who: USER  TTY  DATE  TIME  (IP)
+        # ── who: همه sessions (بدون فیلتر) ──────────────────────
         while IFS= read -r _wl; do
             _wt=$(echo "$_wl" | awk '{print $2}')
             [ -z "$_wt" ] && continue
@@ -280,35 +279,31 @@ ssh_monitor() {
             _wdt=$(echo "$_wl" | awk '{print $3, $4}')
             TTY_LOGIN["$_wt"]="$_wdt"
             [ -n "$_wip" ] && TTY_IP["$_wt"]="$_wip"
-        done < <(who 2>/dev/null | grep 'pts/' || true)
+        done < <(who 2>/dev/null || true)
 
-        # w -h: USER  TTY  FROM  LOGIN  IDLE  JCPU  PCPU  WHAT
+        # ── w: IDLE time ─────────────────────────────────────────
         while IFS= read -r _wl; do
             _wt=$(echo "$_wl" | awk '{print $2}')
             _wi=$(echo "$_wl" | awk '{print $5}')
             [ -n "$_wt" ] && TTY_IDLE["$_wt"]="$_wi"
-        done < <(w -h 2>/dev/null | grep 'pts/' || true)
+        done < <(w -h 2>/dev/null || true)
 
-        # ── Best source of IP: SSH_TTY env var in sshd child procs ──
-        # Each sshd child has SSH_CLIENT=<remoteIP port serverport>
-        # and SSH_TTY=/dev/pts/N  → lets us key by PTY exactly
-        declare -A PTY_IP_MAP
+        # ── IP از /proc: SSH_TTY + SSH_CLIENT ────────────────────
         for _pid_env in /proc/[0-9]*/environ; do
             _p="${_pid_env%/environ}"; _p="${_p##*/proc/}"
             [ -z "$_p" ] && continue
             _cmd=$(cat "/proc/${_p}/comm" 2>/dev/null) || continue
             [ "$_cmd" != "sshd" ] && continue
-            # Read environ safely
             _env=$(tr '\0' '\n' < "/proc/${_p}/environ" 2>/dev/null) || continue
             _sc=$(echo "$_env" | grep '^SSH_CLIENT=' | cut -d= -f2 | awk '{print $1}')
-            [ -z "$_sc" ] || echo "$_sc" | grep -qE '^127\.' && continue
+            [ -z "$_sc" ] && continue
+            echo "$_sc" | grep -qE '^127\.' && continue
             _stty=$(echo "$_env" | grep '^SSH_TTY=' | cut -d= -f2 | sed 's|/dev/||')
-            # _stty is now e.g. "pts/1"
             [ -n "$_stty" ] && PTY_IP_MAP["$_stty"]="$_sc"
         done
 
-        # Build final session list from who
-        mapfile -t WHO_LINES < <(who 2>/dev/null | grep 'pts/' || true)
+        # ── لیست نهایی از who بدون هیچ فیلتری ──────────────────
+        mapfile -t WHO_LINES < <(who 2>/dev/null || true)
         COUNT=${#WHO_LINES[@]}
 
         OUT=""
