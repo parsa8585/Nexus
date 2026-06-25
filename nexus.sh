@@ -362,17 +362,12 @@ ssh_monitor() {
             _uname=$(getent passwd "$_uid" 2>/dev/null | cut -d: -f1)
             [ -z "$_uname" ] && continue
 
-            # اگه sshd هنوز root هست (pre-auth)، username رو از child بگیر
-            if [[ "$_uname" == "root" ]]; then
-                # child process این sshd رو پیدا کن
-                local _child_uid _child_uname
-                _child_uid=$(awk -v pp="$_pid" \
-                    '/^PPid:/{if($2==pp) found=1} found && /^Uid:/{print $2;exit}' \
-                    /proc/*/status 2>/dev/null | head -1)
-                if [ -n "$_child_uid" ] && [ "$_child_uid" != "0" ]; then
-                    _child_uname=$(getent passwd "$_child_uid" 2>/dev/null | cut -d: -f1)
-                    [ -n "$_child_uname" ] && _uname="$_child_uname"
-                fi
+            # sshd privilege-separation user رو skip کن (system user بدون shell)
+            # این userها: sshd، nobody، و هر system user با nologin/false shell
+            local _shell
+            _shell=$(getent passwd "$_uname" 2>/dev/null | cut -d: -f7)
+            if [[ "$_shell" == *nologin* ]] || [[ "$_shell" == *false* ]] || [[ "$_shell" == "/bin/sync" ]]; then
+                continue
             fi
 
             # duplicate: user|IP
