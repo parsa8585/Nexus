@@ -56,6 +56,11 @@ chmod +x nexus.sh
 # Run
 sudo bash nexus.sh
 ```
+## 🗑️ Uninstall
+
+```bash
+sudo rm -f /usr/local/bin/nexus
+```
 
 ---
 
@@ -114,11 +119,6 @@ sudo bash nexus.sh
 
 ---
 
-## 🗑️ Uninstall
-
-```bash
-sudo rm -f /usr/local/bin/nexus
-```
 
 That's it — no config files or dependencies are left behind.
 
