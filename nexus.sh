@@ -269,88 +269,109 @@ ssh_monitor() {
     trap 'tput rmcup 2>/dev/null; tput cnorm 2>/dev/null; return' INT
 
     while true; do
-        SESSIONS=$(w -h 2>/dev/null || who 2>/dev/null | awk '{print $1,$2,"","","","","",""}')
-        COUNT=0; [ -n "$SESSIONS" ] && COUNT=$(echo "$SESSIONS" | grep -c . 2>/dev/null || echo 0)
+        # Use who for active sessions (reliable TTY + login time)
+        # Format: USER TTY (IP) DATE TIME
+        mapfile -t WHO_LINES < <(who 2>/dev/null | grep pts || true)
+        COUNT=${#WHO_LINES[@]}
 
-        declare -A IP_MAP
-        # Build map: username → real remote IP from SSH_CLIENT in sshd process env
-        # sshd forks a child per session; that child has SSH_CLIENT set
-        declare -A USER_IP_MAP
-        for _pid in /proc/[0-9]*/environ; do
-            _p=$(echo "$_pid" | grep -oE '[0-9]+')
-            [ -z "$_p" ] && continue
-            # Only look at sshd processes
-            _cmd=$(cat "/proc/${_p}/comm" 2>/dev/null)
-            [ "$_cmd" != "sshd" ] && continue
-            _env=$(cat "/proc/${_p}/environ" 2>/dev/null | tr '\0' '\n')
-            _ssh_client=$(echo "$_env" | grep '^SSH_CLIENT=' | cut -d= -f2 | awk '{print $1}')
-            [ -z "$_ssh_client" ] && continue
-            # Skip private/loopback
-            echo "$_ssh_client" | grep -qE '^(127\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|::1)' && continue
-            _uname=$(echo "$_env" | grep '^USER=' | cut -d= -f2)
-            [ -z "$_uname" ] && _uname=$(cat "/proc/${_p}/loginuid" 2>/dev/null                 | xargs -I{} getent passwd {} 2>/dev/null | cut -d: -f1)
-            [ -n "$_uname" ] && USER_IP_MAP["$_uname"]="$_ssh_client"
+        # Build maps from who output
+        declare -A TTY_USER TTY_IP TTY_LOGIN
+        for _wl in "${WHO_LINES[@]}"; do
+            _wu=$(echo "$_wl"  | awk '{print $1}')
+            _wt=$(echo "$_wl"  | awk '{print $2}')
+            _wip=$(echo "$_wl" | grep -oE '\([^)]+\)' | tr -d '()')
+            _wdt=$(echo "$_wl" | awk '{print $3, $4}')
+            [ -n "$_wt" ] && TTY_USER["$_wt"]="$_wu"
+            [ -n "$_wt" ] && TTY_LOGIN["$_wt"]="$_wdt"
+            [ -n "$_wt" ] && [ -n "$_wip" ] && TTY_IP["$_wt"]="$_wip"
         done
 
-        # Map PTY → IP via ss (for non-tunnel direct connections)
-        while IFS= read -r ssline; do
-            FOREIGN=$(echo "$ssline" | awk '{print $5}')
-            PROC=$(echo "$ssline"    | awk '{print $NF}')
-            RAW_IP=$(echo "$FOREIGN" | sed 's/\[//g;s/\]//g' | rev | cut -d':' -f2- | rev)
-            echo "$RAW_IP" | grep -qE '^(127\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)' && continue
-            PTS=$(echo "$PROC" | grep -oE 'pts/[0-9]+' | head -1)
-            [ -n "$PTS" ] && [ -n "$RAW_IP" ] && IP_MAP["$PTS"]="$RAW_IP"
+        # Build SSH_CLIENT map from /proc: username→realIP (most reliable)
+        declare -A USER_IP_MAP
+        for _pid_env in /proc/[0-9]*/environ; do
+            _p=$(echo "$_pid_env" | grep -oE '/proc/([0-9]+)/' | grep -oE '[0-9]+')
+            [ -z "$_p" ] && continue
+            _cmd=$(cat "/proc/${_p}/comm" 2>/dev/null || true)
+            [ "$_cmd" != "sshd" ] && continue
+            _env=$(strings "/proc/${_p}/environ" 2>/dev/null || cat "/proc/${_p}/environ" 2>/dev/null | tr '\0' '\n')
+            _sc=$(echo "$_env" | grep '^SSH_CLIENT=' | cut -d= -f2 | awk '{print $1}')
+            [ -z "$_sc" ] && continue
+            _un=$(echo "$_env" | grep '^USER=' | cut -d= -f2)
+            [ -z "$_un" ] && continue
+            # Only store if it looks like a real IP (not loopback 127.x)
+            echo "$_sc" | grep -qE '^127\.' && continue
+            USER_IP_MAP["$_un"]="$_sc"
+        done
+
+        # Also try ss to get PTY→IP for direct (non-proxied) connections
+        declare -A PTY_IP_MAP
+        while IFS= read -r _ssl; do
+            _foreign=$(echo "$_ssl" | awk '{print $5}')
+            _proc=$(echo "$_ssl"    | awk '{print $NF}')
+            _pts=$(echo "$_proc"    | grep -oE 'pts/[0-9]+' | head -1)
+            [ -z "$_pts" ] && continue
+            _rip=$(echo "$_foreign" | sed 's/\[//g;s/\]//g' | rev | cut -d':' -f2- | rev)
+            echo "$_rip" | grep -qE '^127\.' && continue
+            PTY_IP_MAP["$_pts"]="$_rip"
         done < <(ss -tnp 2>/dev/null | grep -i sshd || true)
 
-        # Fallback: who output (contains real IP in parentheses for direct SSH)
-        declare -A WHO_MAP
-        while IFS= read -r wholine; do
-            W_TTY=$(echo "$wholine" | awk '{print $2}')
-            W_IP=$(echo "$wholine"  | grep -oE '\([0-9a-fA-F:.]+\)' | tr -d '()')
-            echo "$W_IP" | grep -qE '^(127\.|::1)' && continue
-            [ -n "$W_TTY" ] && [ -n "$W_IP" ] && WHO_MAP["$W_TTY"]="$W_IP"
-        done < <(who 2>/dev/null || true)
+        # IDLE from w (keyed by user+tty)
+        declare -A TTY_IDLE
+        while IFS= read -r _wl; do
+            _wu=$(echo "$_wl" | awk '{print $1}')
+            _wt=$(echo "$_wl" | awk '{print $2}')
+            _wi=$(echo "$_wl" | awk '{print $5}')
+            [ -n "$_wt" ] && TTY_IDLE["$_wt"]="$_wi"
+        done < <(w -h 2>/dev/null || true)
 
         OUT=""
         OUT+="$(sep_top)"$'\n'
         OUT+="$(row "$(printf '%*s%s' $(( (W - 21) / 2 )) '' 'SSH Active Sessions')")"$'\n'
         OUT+="$(row "  Q=back    $(date '+%Y-%m-%d %H:%M:%S')")"$'\n'
         OUT+="$(sep_mid)"$'\n'
-        OUT+="$(row "  Online Users: $COUNT")"$'\n'
+        OUT+="$(row "  Online: $COUNT")"$'\n'
         OUT+="$(sep_mid)"$'\n'
-        OUT+="$(row "  USER       IP              LOGIN   IDLE WHAT")"$'\n'
+        OUT+="$(row "  USER       IP              LOGIN        IDLE")"$'\n'
         OUT+="$(sep_mid)"$'\n'
 
         if [ "$COUNT" -eq 0 ]; then
             OUT+="$(row "  No active SSH sessions")"$'\n'
         else
-            while IFS= read -r sess; do
-                [ -z "$sess" ] && continue
-                U=$(    echo "$sess" | awk '{print $1}')
-                TTY=$(  echo "$sess" | awk '{print $2}')
-                LOGIN=$(echo "$sess" | awk '{print $4}')
-                IDLE=$( echo "$sess" | awk '{print $5}')
-                WHAT=$( echo "$sess" | awk '{print $8}' | cut -c1-8)
+            for _wl in "${WHO_LINES[@]}"; do
+                U=$(echo "$_wl"   | awk '{print $1}')
+                TTY=$(echo "$_wl" | awk '{print $2}')
 
-                # Priority: PTY→IP (ss) > USER→IP (SSH_CLIENT env) > who > unknown
-                if [ -n "${IP_MAP[$TTY]}" ]; then
-                    IP="${IP_MAP[$TTY]}"
-                elif [ -n "${USER_IP_MAP[$U]}" ]; then
+                # IP priority: SSH_CLIENT env > ss PTY map > who parentheses
+                if [ -n "${USER_IP_MAP[$U]}" ]; then
                     IP="${USER_IP_MAP[$U]}"
-                elif [ -n "${WHO_MAP[$TTY]}" ]; then
-                    IP="${WHO_MAP[$TTY]}"
+                elif [ -n "${PTY_IP_MAP[$TTY]}" ]; then
+                    IP="${PTY_IP_MAP[$TTY]}"
+                elif [ -n "${TTY_IP[$TTY]}" ]; then
+                    IP="${TTY_IP[$TTY]}"
                 else
-                    IP="unknown"
+                    IP="-"
                 fi
 
-                LINE=$(printf "  %-10s%-16s%-9s%-6s%s" \
-                    "$U" "${IP:0:15}" "$LOGIN" "$IDLE" "$WHAT")
+                LOGIN="${TTY_LOGIN[$TTY]:-}"
+                # Format: HH:MM if today, else MM-DD HH:MM
+                _ldate=$(echo "$LOGIN" | awk '{print $1}')
+                _ltime=$(echo "$LOGIN" | awk '{print $2}' | cut -c1-5)
+                if [ "$_ldate" = "$(date '+%Y-%m-%d')" ]; then
+                    LOGIN="$_ltime"
+                else
+                    LOGIN=$(date -d "$_ldate" '+%m-%d' 2>/dev/null || echo "$_ldate" | cut -c6-10)" $_ltime"
+                fi
+
+                IDLE="${TTY_IDLE[$TTY]:-}"
+
+                LINE=$(printf "  %-10s%-16s%-13s%s" \
+                    "${U:0:9}" "${IP:0:15}" "${LOGIN:0:12}" "${IDLE:0:6}")
                 OUT+="$(row "$LINE")"$'\n'
-            done <<< "$SESSIONS"
+            done
         fi
         OUT+="$(sep_bot)"$'\n'
 
-        unset IP_MAP WHO_MAP USER_IP_MAP
+        unset TTY_USER TTY_IP TTY_LOGIN TTY_IDLE PTY_IP_MAP USER_IP_MAP WHO_LINES
 
         tput cup 0 0 2>/dev/null
         printf '%s' "$OUT"
@@ -2953,36 +2974,31 @@ check_web_ports() {
             VERDICT="⚠ Partial"; VCOLOR="${YELLOW}"
         fi
 
+        # _crow: colored row — prints label+value inside box, pads to W
+        # Usage: _crow "  Label  :" "value text" COLOR
+        _crow() {
+            local LABEL="$1" VAL="$2" COL="$3"
+            local PLAIN="${LABEL} ${VAL}"
+            local PAD=$(( W - ${#PLAIN} ))
+            [ "$PAD" -lt 0 ] && PAD=0
+            printf "${CYAN}|${NC}${LABEL} ${COL}${VAL}${NC}%${PAD}s${CYAN}|${NC}\n" ""
+        }
+
         sep_mid
         row "  Port ${PORT} — ${LABEL}"
         sep_mid
 
-        # Listening row
-        if [ "$LISTENING" = "Yes" ]; then
-            rowc 36 "  Listening  : ${GREEN}Yes — service active${NC}"
-        else
-            rowc 29 "  Listening  : ${RED}No${NC}"
-        fi
+        if   [ "$LISTENING" = "Yes" ]; then _crow "  Listening :" "Yes" "${GREEN}"
+        else                                 _crow "  Listening :" "No"  "${RED}"; fi
 
-        # Firewall row
-        if [ "$FW_OK" = "Allowed" ]; then
-            rowc 35 "  Firewall   : ${GREEN}Allowed${NC}"
-        elif [ "$FW_OK" = "Blocked" ]; then
-            rowc 34 "  Firewall   : ${RED}Blocked${NC}"
-        else
-            rowc 37 "  Firewall   : ${DIM}No firewall${NC}"
-        fi
+        if   [ "$FW_OK" = "Allowed" ];     then _crow "  Firewall  :" "Allowed"     "${GREEN}"
+        elif [ "$FW_OK" = "Blocked" ];     then _crow "  Firewall  :" "Blocked"     "${RED}"
+        else                                    _crow "  Firewall  :" "No firewall" "${DIM}"; fi
 
-        # Connectable row
-        if [ "$USABLE" = "Open" ]; then
-            rowc 32 "  Connect    : ${GREEN}Open${NC}"
-        else
-            rowc 31 "  Connect    : ${RED}Closed${NC}"
-        fi
+        if   [ "$USABLE" = "Open" ]; then _crow "  Connect   :" "Open"   "${GREEN}"
+        else                              _crow "  Connect   :" "Closed" "${RED}"; fi
 
-        # Verdict row
-        local VVIS=$(( ${#VERDICT} + 15 ))
-        rowc $VVIS "  Status     : ${VCOLOR}${VERDICT}${NC}"
+        _crow "  Status    :" "$VERDICT" "${VCOLOR}"
     }
 
     _check_port 80  "HTTP"
